@@ -5,6 +5,9 @@
 //! future changes can fill in the actual orchestration logic without rewriting
 //! the API shape.
 
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
@@ -17,7 +20,11 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tokio::sync::RwLock;
 use uuid::Uuid;
+
+use crate::antares::fuse::AntaresFuse;
+use crate::dicfuse::Dicfuse;
 
 /// High-level HTTP daemon that exposes Antares orchestration capabilities.
 pub struct AntaresDaemon<S: AntaresService> {
@@ -226,5 +233,137 @@ impl IntoResponse for ApiError {
         };
 
         (status_code, Json(body)).into_response()
+    }
+}
+
+// ============================================================================
+// Service Implementation
+// ============================================================================
+
+/// Internal entry tracking a single mount.
+struct MountEntry {
+    mount_id: Uuid,
+    request: CreateMountRequest,
+    fuse: AntaresFuse,
+    state: MountLifecycle,
+    created_at_epoch_ms: u64,
+    last_seen_epoch_ms: u64,
+}
+
+impl MountEntry {
+    /// Convert to public MountStatus for API responses.
+    fn to_status(&self) -> MountStatus {
+        MountStatus {
+            mount_id: self.mount_id,
+            mountpoint: self.request.mountpoint.clone(),
+            layers: MountLayers {
+                upper: self.request.upper_dir.clone(),
+                cl: self.request.cl_dir.clone(),
+                dicfuse: "shared".to_string(),
+            },
+            state: self.state.clone(),
+            created_at_epoch_ms: self.created_at_epoch_ms,
+            last_seen_epoch_ms: self.last_seen_epoch_ms,
+        }
+    }
+
+    /// Update the last_seen timestamp.
+    fn update_last_seen(&mut self) {
+        self.last_seen_epoch_ms = current_epoch_ms();
+    }
+}
+
+/// Get current time as milliseconds since UNIX epoch.
+fn current_epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/// Concrete implementation of AntaresService.
+pub struct AntaresServiceImpl {
+    /// Shared Dicfuse instance (read-only base layer).
+    dicfuse: Arc<Dicfuse>,
+    /// Active mounts indexed by UUID.
+    mounts: Arc<RwLock<HashMap<Uuid, MountEntry>>>,
+    /// Service start time for uptime calculation.
+    start_time: Instant,
+}
+
+impl AntaresServiceImpl {
+    /// Create a new service instance.
+    ///
+    /// # Arguments
+    /// * `dicfuse` - Optional shared Dicfuse instance. If None, creates a new one.
+    ///
+    /// # Note
+    /// Requires config to be initialized via `config::init_config()` before calling.
+    pub async fn new(dicfuse: Option<Arc<Dicfuse>>) -> Self {
+        let dic = match dicfuse {
+            Some(d) => d,
+            None => Arc::new(Dicfuse::new().await),
+        };
+        Self {
+            dicfuse: dic,
+            mounts: Arc::new(RwLock::new(HashMap::new())),
+            start_time: Instant::now(),
+        }
+    }
+
+    /// Validate the create mount request.
+    fn validate_request(request: &CreateMountRequest) -> Result<(), ServiceError> {
+        if request.mountpoint.is_empty() {
+            return Err(ServiceError::InvalidRequest(
+                "mountpoint cannot be empty".into(),
+            ));
+        }
+        if request.upper_dir.is_empty() {
+            return Err(ServiceError::InvalidRequest(
+                "upper_dir cannot be empty".into(),
+            ));
+        }
+        // readonly not yet supported - must be false
+        if request.readonly {
+            return Err(ServiceError::InvalidRequest(
+                "readonly mounts are not yet supported".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Check if a mountpoint is already in use.
+    async fn is_mountpoint_in_use(&self, mountpoint: &str) -> bool {
+        let mounts = self.mounts.read().await;
+        mounts
+            .values()
+            .any(|e| e.request.mountpoint == mountpoint)
+    }
+
+    /// Get service health information.
+    pub async fn health_info(&self) -> HealthResponse {
+        let mounts = self.mounts.read().await;
+        HealthResponse {
+            status: "healthy".to_string(),
+            mount_count: mounts.len(),
+            uptime_secs: self.start_time.elapsed().as_secs(),
+        }
+    }
+
+    /// Cleanup all mounts during shutdown.
+    pub async fn shutdown_cleanup(&self) -> Result<(), ServiceError> {
+        let mut mounts = self.mounts.write().await;
+        let mount_ids: Vec<Uuid> = mounts.keys().cloned().collect();
+
+        for mount_id in mount_ids {
+            if let Some(mut entry) = mounts.remove(&mount_id) {
+                tracing::info!("Unmounting {} during shutdown", mount_id);
+                if let Err(e) = entry.fuse.unmount().await {
+                    tracing::warn!("Failed to unmount {} during shutdown: {}", mount_id, e);
+                    // Continue with other mounts even if one fails
+                }
+            }
+        }
+        Ok(())
     }
 }
