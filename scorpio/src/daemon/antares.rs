@@ -64,8 +64,30 @@ where
     }
 
     /// Run the HTTP server until it receives a shutdown signal.
+    /// Note: For graceful shutdown with mount cleanup, use AntaresDaemon<AntaresServiceImpl>.
     pub async fn serve(self) -> Result<(), ApiError> {
-        todo!("Bind hyper server and serve router");
+        let router = self.router();
+
+        let listener = tokio::net::TcpListener::bind(self.bind_addr)
+            .await
+            .map_err(|e| {
+                ApiError::Service(ServiceError::Internal(format!(
+                    "failed to bind to {}: {}",
+                    self.bind_addr, e
+                )))
+            })?;
+
+        tracing::info!("Antares daemon listening on {}", self.bind_addr);
+
+        axum::serve(listener, router)
+            .with_graceful_shutdown(async {
+                let _ = tokio::signal::ctrl_c().await;
+                tracing::info!("Received shutdown signal");
+            })
+            .await
+            .map_err(|e| ApiError::Service(ServiceError::Internal(format!("server error: {}", e))))?;
+
+        Ok(())
     }
 
     /// Lightweight health/liveness probe.
