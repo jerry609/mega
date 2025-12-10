@@ -152,6 +152,26 @@ pub enum MountLifecycle {
     Failed { reason: String },
 }
 
+/// Health check response payload.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct HealthResponse {
+    /// Service health status: "healthy" or "degraded"
+    pub status: String,
+    /// Current number of active mounts
+    pub mount_count: usize,
+    /// Service uptime in seconds
+    pub uptime_secs: u64,
+}
+
+/// Error response body for JSON output.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ErrorBody {
+    /// Human-readable error message
+    pub error: String,
+    /// Machine-readable error code
+    pub code: String,
+}
+
 /// Service-level failures (implementation specific) that surface through the API.
 #[derive(Debug, Error)]
 pub enum ServiceError {
