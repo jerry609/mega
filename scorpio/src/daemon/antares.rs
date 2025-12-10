@@ -367,3 +367,108 @@ impl AntaresServiceImpl {
         Ok(())
     }
 }
+
+#[async_trait]
+impl AntaresService for AntaresServiceImpl {
+    async fn create_mount(&self, request: CreateMountRequest) -> Result<MountStatus, ServiceError> {
+        // 1. Validate request
+        Self::validate_request(&request)?;
+
+        // 2. Quick check: is mountpoint already in use?
+        if self.is_mountpoint_in_use(&request.mountpoint).await {
+            return Err(ServiceError::InvalidRequest(format!(
+                "mountpoint {} is already in use",
+                request.mountpoint
+            )));
+        }
+
+        // 3. Prepare paths
+        let mountpoint = PathBuf::from(&request.mountpoint);
+        let upper_dir = PathBuf::from(&request.upper_dir);
+        let cl_dir = request.cl_dir.as_ref().map(PathBuf::from);
+
+        // 4. Create AntaresFuse instance (may take time, not holding lock)
+        let mut fuse = AntaresFuse::new(mountpoint, self.dicfuse.clone(), upper_dir, cl_dir)
+            .await
+            .map_err(|e| ServiceError::FuseFailure(format!("failed to create fuse: {}", e)))?;
+
+        // 5. Mount the filesystem
+        fuse.mount()
+            .await
+            .map_err(|e| ServiceError::FuseFailure(format!("failed to mount: {}", e)))?;
+
+        // 6. Generate mount ID and create entry
+        let mount_id = Uuid::new_v4();
+        let now = current_epoch_ms();
+
+        let entry = MountEntry {
+            mount_id,
+            request: request.clone(),
+            fuse,
+            state: MountLifecycle::Mounted,
+            created_at_epoch_ms: now,
+            last_seen_epoch_ms: now,
+        };
+
+        // 7. Double-check and insert (holding write lock)
+        let mut mounts = self.mounts.write().await;
+
+        // Re-check mountpoint (another request might have succeeded during step 4-5)
+        if mounts
+            .values()
+            .any(|e| e.request.mountpoint == request.mountpoint)
+        {
+            // Entry will be dropped, fuse cleanup happens automatically
+            return Err(ServiceError::InvalidRequest(format!(
+                "mountpoint {} was claimed by another request",
+                request.mountpoint
+            )));
+        }
+
+        let status = entry.to_status();
+        mounts.insert(mount_id, entry);
+
+        tracing::info!("Created mount {} at {}", mount_id, request.mountpoint);
+        Ok(status)
+    }
+
+    async fn list_mounts(&self) -> Result<Vec<MountStatus>, ServiceError> {
+        let mounts = self.mounts.read().await;
+        let list: Vec<MountStatus> = mounts.values().map(|e| e.to_status()).collect();
+        Ok(list)
+    }
+
+    async fn describe_mount(&self, mount_id: Uuid) -> Result<MountStatus, ServiceError> {
+        let mounts = self.mounts.read().await;
+        let entry = mounts.get(&mount_id).ok_or(ServiceError::NotFound(mount_id))?;
+        Ok(entry.to_status())
+    }
+
+    async fn delete_mount(&self, mount_id: Uuid) -> Result<MountStatus, ServiceError> {
+        // Get write lock and remove entry
+        let mut mounts = self.mounts.write().await;
+        let mut entry = mounts
+            .remove(&mount_id)
+            .ok_or(ServiceError::NotFound(mount_id))?;
+
+        // Update state
+        entry.state = MountLifecycle::Unmounting;
+        entry.update_last_seen();
+
+        // Release lock before potentially slow unmount operation
+        drop(mounts);
+
+        // Unmount the filesystem
+        if let Err(e) = entry.fuse.unmount().await {
+            tracing::error!("Failed to unmount {}: {}", mount_id, e);
+            entry.state = MountLifecycle::Failed {
+                reason: format!("unmount failed: {}", e),
+            };
+        } else {
+            entry.state = MountLifecycle::Unmounted;
+        }
+
+        tracing::info!("Deleted mount {}", mount_id);
+        Ok(entry.to_status())
+    }
+}
