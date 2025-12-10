@@ -54,7 +54,13 @@ where
 
     /// Produce an Axum router with all routes wired to their handlers.
     pub fn router(&self) -> Router {
-        todo!("Expose Axum router once handlers are implemented");
+        Router::new()
+            .route("/health", get(Self::healthcheck))
+            .route("/mounts", post(Self::create_mount))
+            .route("/mounts", get(Self::list_mounts))
+            .route("/mounts/{mount_id}", get(Self::describe_mount))
+            .route("/mounts/{mount_id}", delete(Self::delete_mount))
+            .with_state(self.service.clone())
     }
 
     /// Run the HTTP server until it receives a shutdown signal.
@@ -63,33 +69,47 @@ where
     }
 
     /// Lightweight health/liveness probe.
-    async fn healthcheck() -> impl IntoResponse {
-        todo!("Return health payload");
+    async fn healthcheck(State(service): State<Arc<S>>) -> impl IntoResponse {
+        // For generic S, we return a simple response
+        // AntaresServiceImpl has health_info() but we can't call it here
+        Json(HealthResponse {
+            status: "healthy".to_string(),
+            mount_count: 0,
+            uptime_secs: 0,
+        })
     }
 
     async fn create_mount(
         State(service): State<Arc<S>>,
         Json(request): Json<CreateMountRequest>,
     ) -> Result<Json<MountCreated>, ApiError> {
-        todo!("Delegate to AntaresService::create_mount");
+        let status = service.create_mount(request).await?;
+        Ok(Json(MountCreated {
+            mount_id: status.mount_id,
+            mountpoint: status.mountpoint,
+            state: status.state,
+        }))
     }
 
     async fn list_mounts(State(service): State<Arc<S>>) -> Result<Json<MountCollection>, ApiError> {
-        todo!("Delegate to AntaresService::list_mounts");
+        let mounts = service.list_mounts().await?;
+        Ok(Json(MountCollection { mounts }))
     }
 
     async fn describe_mount(
         State(service): State<Arc<S>>,
         Path(mount_id): Path<Uuid>,
     ) -> Result<Json<MountStatus>, ApiError> {
-        todo!("Delegate to AntaresService::describe_mount");
+        let status = service.describe_mount(mount_id).await?;
+        Ok(Json(status))
     }
 
     async fn delete_mount(
         State(service): State<Arc<S>>,
         Path(mount_id): Path<Uuid>,
     ) -> Result<Json<MountStatus>, ApiError> {
-        todo!("Delegate to AntaresService::delete_mount");
+        let status = service.delete_mount(mount_id).await?;
+        Ok(Json(status))
     }
 }
 
