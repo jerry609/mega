@@ -514,3 +514,366 @@ impl AntaresService for AntaresServiceImpl {
         Ok(entry.to_status())
     }
 }
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    /// Mock service for testing HTTP layer without actual FUSE operations
+    struct MockAntaresService {
+        mounts: Arc<RwLock<HashMap<Uuid, MountStatus>>>,
+    }
+
+    impl MockAntaresService {
+        fn new() -> Self {
+            Self {
+                mounts: Arc::new(RwLock::new(HashMap::new())),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl AntaresService for MockAntaresService {
+        async fn create_mount(
+            &self,
+            request: CreateMountRequest,
+        ) -> Result<MountStatus, ServiceError> {
+            if request.mountpoint.is_empty() {
+                return Err(ServiceError::InvalidRequest(
+                    "mountpoint cannot be empty".into(),
+                ));
+            }
+            if request.upper_dir.is_empty() {
+                return Err(ServiceError::InvalidRequest(
+                    "upper_dir cannot be empty".into(),
+                ));
+            }
+            if request.readonly {
+                return Err(ServiceError::InvalidRequest(
+                    "readonly mounts are not yet supported".into(),
+                ));
+            }
+
+            // Check for duplicate mountpoint
+            {
+                let mounts = self.mounts.read().await;
+                if mounts.values().any(|m| m.mountpoint == request.mountpoint) {
+                    return Err(ServiceError::InvalidRequest(format!(
+                        "mountpoint {} is already in use",
+                        request.mountpoint
+                    )));
+                }
+            }
+
+            let mount_id = Uuid::new_v4();
+            let status = MountStatus {
+                mount_id,
+                mountpoint: request.mountpoint,
+                layers: MountLayers {
+                    upper: request.upper_dir,
+                    cl: request.cl_dir,
+                    dicfuse: "mock".into(),
+                },
+                state: MountLifecycle::Mounted,
+                created_at_epoch_ms: 0,
+                last_seen_epoch_ms: 0,
+            };
+            self.mounts.write().await.insert(mount_id, status.clone());
+            Ok(status)
+        }
+
+        async fn list_mounts(&self) -> Result<Vec<MountStatus>, ServiceError> {
+            Ok(self.mounts.read().await.values().cloned().collect())
+        }
+
+        async fn describe_mount(&self, mount_id: Uuid) -> Result<MountStatus, ServiceError> {
+            self.mounts
+                .read()
+                .await
+                .get(&mount_id)
+                .cloned()
+                .ok_or(ServiceError::NotFound(mount_id))
+        }
+
+        async fn delete_mount(&self, mount_id: Uuid) -> Result<MountStatus, ServiceError> {
+            self.mounts
+                .write()
+                .await
+                .remove(&mount_id)
+                .map(|mut s| {
+                    s.state = MountLifecycle::Unmounted;
+                    s
+                })
+                .ok_or(ServiceError::NotFound(mount_id))
+        }
+    }
+
+    fn create_test_router() -> Router {
+        let service = Arc::new(MockAntaresService::new());
+        let daemon = AntaresDaemon::new("127.0.0.1:0".parse().unwrap(), service);
+        daemon.router()
+    }
+
+    #[tokio::test]
+    async fn test_healthcheck() {
+        let app = create_test_router();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let health: HealthResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(health.status, "healthy");
+    }
+
+    #[tokio::test]
+    async fn test_create_mount_success() {
+        let app = create_test_router();
+
+        let body = serde_json::json!({
+            "mountpoint": "/tmp/test",
+            "upper_dir": "/tmp/upper",
+            "labels": [],
+            "readonly": false
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mounts")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let created: MountCreated = serde_json::from_slice(&body).unwrap();
+        assert_eq!(created.mountpoint, "/tmp/test");
+        assert!(matches!(created.state, MountLifecycle::Mounted));
+    }
+
+    #[tokio::test]
+    async fn test_list_mounts_empty() {
+        let app = create_test_router();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/mounts")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let collection: MountCollection = serde_json::from_slice(&body).unwrap();
+        assert!(collection.mounts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_describe_nonexistent_mount_returns_404() {
+        let app = create_test_router();
+        let fake_id = Uuid::new_v4();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/mounts/{}", fake_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_error_response_format() {
+        let app = create_test_router();
+        let fake_id = Uuid::new_v4();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/mounts/{}", fake_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let error: ErrorBody = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(error.code, "NOT_FOUND");
+        assert!(error.error.contains(&fake_id.to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_readonly_mount_rejected() {
+        let app = create_test_router();
+
+        let body = serde_json::json!({
+            "mountpoint": "/tmp/test",
+            "upper_dir": "/tmp/upper",
+            "labels": [],
+            "readonly": true
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mounts")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let error: ErrorBody = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error.code, "INVALID_REQUEST");
+    }
+
+    #[tokio::test]
+    async fn test_empty_mountpoint_rejected() {
+        let app = create_test_router();
+
+        let body = serde_json::json!({
+            "mountpoint": "",
+            "upper_dir": "/tmp/upper",
+            "labels": [],
+            "readonly": false
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mounts")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_mount_requests() {
+        let service = Arc::new(MockAntaresService::new());
+
+        let handles: Vec<_> = (0..10)
+            .map(|i| {
+                let svc = service.clone();
+                tokio::spawn(async move {
+                    svc.create_mount(CreateMountRequest {
+                        mountpoint: format!("/tmp/mount{}", i),
+                        upper_dir: format!("/tmp/upper{}", i),
+                        cl_dir: None,
+                        labels: vec![],
+                        readonly: false,
+                    })
+                    .await
+                })
+            })
+            .collect();
+
+        for h in handles {
+            assert!(h.await.unwrap().is_ok());
+        }
+
+        // All 10 mounts should exist
+        let mounts = service.list_mounts().await.unwrap();
+        assert_eq!(mounts.len(), 10);
+    }
+
+    #[tokio::test]
+    async fn test_duplicate_mountpoint_rejected() {
+        let service = Arc::new(MockAntaresService::new());
+
+        let request = CreateMountRequest {
+            mountpoint: "/tmp/duplicate".into(),
+            upper_dir: "/tmp/upper".into(),
+            cl_dir: None,
+            labels: vec![],
+            readonly: false,
+        };
+
+        // First mount should succeed
+        let result1 = service.create_mount(request.clone()).await;
+        assert!(result1.is_ok());
+
+        // Second mount with same mountpoint should fail
+        let result2 = service.create_mount(request).await;
+        assert!(matches!(result2, Err(ServiceError::InvalidRequest(_))));
+    }
+
+    #[tokio::test]
+    async fn test_delete_mount_success() {
+        let service = Arc::new(MockAntaresService::new());
+
+        // Create a mount
+        let status = service
+            .create_mount(CreateMountRequest {
+                mountpoint: "/tmp/to_delete".into(),
+                upper_dir: "/tmp/upper".into(),
+                cl_dir: None,
+                labels: vec![],
+                readonly: false,
+            })
+            .await
+            .unwrap();
+
+        let mount_id = status.mount_id;
+
+        // Delete it
+        let deleted = service.delete_mount(mount_id).await.unwrap();
+        assert!(matches!(deleted.state, MountLifecycle::Unmounted));
+
+        // Verify it's gone
+        let result = service.describe_mount(mount_id).await;
+        assert!(matches!(result, Err(ServiceError::NotFound(_))));
+    }
+}
