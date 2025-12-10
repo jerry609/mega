@@ -10,6 +10,7 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 use async_trait::async_trait;
 use axum::{
     extract::{Path, State},
+    http::StatusCode,
     response::{IntoResponse, Response},
     routing::{delete, get, post},
     Json, Router,
@@ -198,6 +199,32 @@ pub enum ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        todo!("Translate ApiError into Axum response");
+        let (status_code, error_code, message) = match &self {
+            ApiError::Service(ServiceError::InvalidRequest(msg)) => {
+                (StatusCode::BAD_REQUEST, "INVALID_REQUEST", msg.clone())
+            }
+            ApiError::Service(ServiceError::NotFound(id)) => {
+                (StatusCode::NOT_FOUND, "NOT_FOUND", format!("mount {} not found", id))
+            }
+            ApiError::Service(ServiceError::FuseFailure(msg)) => {
+                (StatusCode::INTERNAL_SERVER_ERROR, "FUSE_ERROR", msg.clone())
+            }
+            ApiError::Service(ServiceError::Internal(msg)) => {
+                (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", msg.clone())
+            }
+            ApiError::BadPayload(msg) => {
+                (StatusCode::BAD_REQUEST, "BAD_PAYLOAD", msg.clone())
+            }
+            ApiError::Shutdown => {
+                (StatusCode::SERVICE_UNAVAILABLE, "SHUTDOWN", "server is shutting down".into())
+            }
+        };
+
+        let body = ErrorBody {
+            error: message,
+            code: error_code.to_string(),
+        };
+
+        (status_code, Json(body)).into_response()
     }
 }
