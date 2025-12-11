@@ -134,17 +134,42 @@ impl DicItem {
 }
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
+struct FileTreeEntry {
+    tree_items: Vec<Item>,
+    #[serde(default)]
+    total_count: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Default, Clone)]
+struct ApiData {
+    #[serde(default)]
+    file_tree: std::collections::HashMap<String, FileTreeEntry>,
+    #[serde(default)]
+    tree_items: Vec<Item>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Default, Clone)]
 struct ApiResponse {
     req_result: bool,
-    data: Vec<Item>,
+    data: ApiData,
     err_message: String,
 }
+
+impl ApiResponse {
+    /// Get all items from tree_items in data
+    fn get_items(&self) -> Vec<Item> {
+        self.data.tree_items.clone()
+    }
+}
+
 impl Iterator for ApiResponse {
     type Item = Item;
     fn next(&mut self) -> Option<Self::Item> {
-        self.data.pop()
+        self.data.tree_items.pop()
     }
 }
+
+#[allow(dead_code)]
 struct ApiResponseExt {
     _req_result: bool,
     data: Vec<ItemExt>,
