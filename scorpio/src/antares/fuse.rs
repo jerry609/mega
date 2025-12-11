@@ -308,6 +308,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "manual test with infinite loop, requires privileged FUSE mount"]
     async fn creates_dirs_and_placeholder_overlay() {
         let base = PathBuf::from("/tmp/antares_test_job1");
         let _ = std::fs::remove_dir_all(&base);
@@ -326,7 +327,7 @@ mod tests {
         .unwrap();
 
         // Build overlay without mounting to the kernel to keep the test unprivileged.
-        let handle = fuse.mount().await.unwrap();
+        let _handle = fuse.mount().await.unwrap();
 
         println!("Mountpoint: {}", mount.display());
         println!("Press Ctrl+C to exit...");

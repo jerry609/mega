@@ -1,4 +1,4 @@
-mod fuse;
+pub mod fuse;
 
 use std::collections::HashMap;
 use std::fs::{self, File};
