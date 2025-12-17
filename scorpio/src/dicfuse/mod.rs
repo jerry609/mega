@@ -102,14 +102,29 @@ impl Layer for Dicfuse {
         &self,
         inode: Inode,
         _handle: Option<u64>,
-        _mapping: bool,
+        mapping: bool,
     ) -> std::io::Result<(libc::stat64, std::time::Duration)> {
+        // Debug: 记录调用信息
+        tracing::debug!(
+            "[Dicfuse::getattr_with_mapping] inode={}, handle={:?}, mapping={}",
+            inode,
+            _handle,
+            mapping
+        );
+        
         // Resolve inode -> StorageItem to derive type/size.
         let item = self
             .store
             .get_inode(inode)
             .await
-            .map_err(|_| std::io::Error::from_raw_os_error(libc::ENOENT))?;
+            .map_err(|e| {
+                tracing::warn!(
+                    "[Dicfuse::getattr_with_mapping] Failed to get inode {}: {:?}",
+                    inode,
+                    e
+                );
+                std::io::Error::from_raw_os_error(libc::ENOENT)
+            })?;
 
         // Use existing ReplyEntry metadata to stay consistent with other Dicfuse paths.
         let attr = item.get_stat().attr;
@@ -162,6 +177,14 @@ impl Layer for Dicfuse {
         stat.st_ctime_nsec = attr.ctime.nsec.into();
 
         // TTL of 2 seconds, consistent with other Dicfuse operations.
+        tracing::debug!(
+            "[Dicfuse::getattr_with_mapping] Success: inode={}, mode={:#o}, size={}, uid={}, gid={}",
+            inode,
+            stat.st_mode,
+            stat.st_size,
+            stat.st_uid,
+            stat.st_gid
+        );
         Ok((stat, std::time::Duration::from_secs(2)))
     }
 }

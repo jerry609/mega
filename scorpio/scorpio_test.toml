@@ -1,0 +1,16 @@
+# 测试用配置 - 减少加载深度以加快速度
+lfs_url = "http://git.gitmega.com"
+store_path = "/tmp/megadir/store_test"
+config_file = "config.toml"
+git_author = "MEGA"
+git_email = "admin@mega.org"
+workspace = "/tmp/megadir/mount"
+base_url = "http://git.gitmega.com"
+dicfuse_readable = "true"
+load_dir_depth = "2"
+fetch_file_thread = "10"
+antares_upper_root = "/tmp/megadir/antares/upper"
+antares_cl_root = "/tmp/megadir/antares/cl"
+antares_mount_root = "/tmp/megadir/antares/mnt"
+antares_state_file = "/tmp/megadir/antares/state.toml"
+
