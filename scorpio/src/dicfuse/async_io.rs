@@ -494,7 +494,10 @@ impl Filesystem for Dicfuse {
 
         for (index, item) in items.iter().enumerate() {
             let entry_offset = (index + 2) as i64;
-            if entry_offset > offset {
+            // `DirectoryEntry.offset` is the offset of the *next* entry.
+            // The kernel passes `offset` as the starting position, so we must include entries
+            // whose current position is >= the provided offset.
+            if entry_offset >= offset {
                 d.push(Ok(DirectoryEntry {
                     inode: item.get_inode(),
                     kind: item.get_filetype().await,
@@ -569,8 +572,11 @@ impl Filesystem for Dicfuse {
         }
 
         for (index, item) in items.iter().enumerate() {
-            let entry_offset = (index + 2) as i64;
-            if entry_offset > offset as i64 {
+            let entry_offset = (index as u64) + 2;
+            // `DirectoryEntryPlus.offset` is the offset of the *next* entry.
+            // The kernel passes `offset` as the starting position, so we must include entries
+            // whose current position is >= the provided offset.
+            if entry_offset >= offset {
                 // Add timeout to prevent blocking if get_stat or get_filetype hang
                 // This can happen if Dicfuse is still loading data or if there's a lock contention
                 let item_name = item.get_name();
@@ -613,7 +619,7 @@ impl Filesystem for Dicfuse {
                     inode: item.get_inode(),
                     kind: filetype,
                     name: item_name.into(),
-                    offset: entry_offset + 1,
+                    offset: (entry_offset + 1) as i64,
                     generation: 0,
                     attr: stat_result.attr,
                     entry_ttl: stat_result.ttl,

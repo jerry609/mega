@@ -175,6 +175,7 @@ mod tests {
     use crate::util::config;
     use async_trait::async_trait;
     use bytes::Bytes;
+    use futures::TryStreamExt;
     use libfuse_fs::context::OperationContext;
     use libfuse_fs::unionfs::{config::Config as UnionConfig, layer::Layer, OverlayFs};
     use rfuse3::raw::reply::{
@@ -534,7 +535,10 @@ mod tests {
             if let Some(children) = st.children.get(&parent) {
                 for (idx, (name, inode)) in children.iter().enumerate() {
                     let entry_offset = (idx + 2) as i64;
-                    if entry_offset > offset {
+                    // `DirectoryEntry.offset` is the offset of the *next* entry.
+                    // The kernel passes `offset` as the starting position, so we must include
+                    // entries whose current position is >= the provided offset.
+                    if entry_offset >= offset {
                         let kind = st
                             .nodes
                             .get(inode)
@@ -634,6 +638,28 @@ mod tests {
     }
 
     /// No actual mount required: validate copy-up behavior via `OverlayFs`'s Filesystem interface.
+    #[tokio::test]
+    async fn test_mem_upper_layer_readdir_offset_includes_first_child() {
+        let upper = MemUpperLayer::new();
+        upper
+            .create_child(1, OsStr::new("a"), FileType::Directory, 0o755)
+            .await
+            .unwrap();
+        upper
+            .create_child(1, OsStr::new("b"), FileType::Directory, 0o755)
+            .await
+            .unwrap();
+        upper
+            .create_child(1, OsStr::new("c"), FileType::Directory, 0o755)
+            .await
+            .unwrap();
+
+        // offset=2 means "start from the first child entry" (after "." and "..").
+        let reply = upper.readdir(Request::default(), 1, 0, 2).await.unwrap();
+        let entries: Vec<DirectoryEntry> = reply.entries.try_collect().await.unwrap();
+        assert_eq!(entries.len(), 3);
+    }
+
     #[tokio::test]
     async fn test_overlay_copyup_without_mount_does_not_mutate_dicfuse_lower() {
         let test_id = Uuid::new_v4();
