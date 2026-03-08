@@ -23,6 +23,10 @@ pub struct TaskBuildRequest {
     pub cl_link: String,
     //TODO: for old database only, delete after updated
     pub cl_id: i64,
+    /// Optional idempotency build id. If provided, repeated submissions with
+    /// the same value return the existing build status instead of creating a new build.
+    #[serde(default)]
+    pub build_id: Option<String>,
     /// The list of file diff changes
     pub changes: Vec<Status<ProjectRelativePath>>,
     /// Buck2 target path (e.g. //app:server). Optional for backward compatibility.

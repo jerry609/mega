@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     error::Error,
-    io::BufReader,
+    io::{self, BufReader},
     path::{Path, PathBuf},
     process::{ExitStatus, Stdio},
     sync::atomic::{AtomicBool, Ordering},
@@ -28,7 +28,7 @@ use tokio::{
     process::Command,
     sync::mpsc::{self, UnboundedSender},
     task::JoinHandle,
-    time::{Duration, interval},
+    time::{Duration, Instant, interval},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -38,6 +38,9 @@ use crate::repo::diff;
 
 const MAX_BATCH_SIZE: usize = 100;
 const FLUSH_INTERVAL_MS: u64 = 100;
+const MOUNT_READY_TIMEOUT_SECS: u64 = 15;
+const MOUNT_READY_POLL_INTERVAL_MS: u64 = 200;
+const MOUNT_READY_SINGLE_PROBE_TIMEOUT_SECS: u64 = 2;
 
 #[allow(dead_code)]
 static PROJECT_ROOT: Lazy<String> =
@@ -284,6 +287,205 @@ fn buck2_isolation_dir(repo_path: &Path) -> anyhow::Result<String> {
     Ok(format!("buck2-isolation-{suffix}"))
 }
 
+/// Best-effort cleanup for per-mount buck2 daemons.
+///
+/// With unique mountpoints each build gets a fresh `--isolation-dir`, which means
+/// buck2 may keep many idle daemons alive. Over time that can exhaust host limits
+/// (e.g. inotify/file locks) and make subsequent daemon startups fail.
+fn cleanup_buck2_daemon(repo_path: &Path) {
+    let Ok(isolation_dir) = buck2_isolation_dir(repo_path) else {
+        return;
+    };
+
+    let status = std::process::Command::new("buck2")
+        .args(["--isolation-dir", &isolation_dir, "kill"])
+        .current_dir(repo_path)
+        .status();
+
+    match status {
+        Ok(exit) if exit.success() => {
+            tracing::debug!(
+                "Cleaned up buck2 daemon for repo {:?} (isolation_dir={})",
+                repo_path,
+                isolation_dir
+            );
+        }
+        Ok(exit) => {
+            tracing::debug!(
+                "buck2 kill returned non-zero for repo {:?} (isolation_dir={}, status={})",
+                repo_path,
+                isolation_dir,
+                exit
+            );
+        }
+        Err(err) => {
+            tracing::debug!(
+                "buck2 kill failed for repo {:?} (isolation_dir={}): {}",
+                repo_path,
+                isolation_dir,
+                err
+            );
+        }
+    }
+}
+
+fn is_retryable_mount_io_error(err: &io::Error) -> bool {
+    err.kind() == io::ErrorKind::TimedOut || matches!(err.raw_os_error(), Some(107 | 116 | 5 | 2))
+}
+
+fn is_retryable_target_discovery_error(err: &anyhow::Error) -> bool {
+    let message = err.to_string();
+    [
+        "Transport endpoint is not connected",
+        "os error 107",
+        "Stale file handle",
+        "os error 116",
+        "Failed to connect to buck daemon",
+        "No such file or directory",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+}
+
+fn probe_repo_mount(repo_path: &Path) -> io::Result<()> {
+    let metadata = std::fs::metadata(repo_path)?;
+    if !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotADirectory,
+            format!("{:?} is not a directory", repo_path),
+        ));
+    }
+
+    let mut entries = std::fs::read_dir(repo_path)?;
+    if let Some(entry) = entries.next() {
+        let entry = entry?;
+        let _ = entry.file_type()?;
+    }
+
+    let mut child = std::process::Command::new("true")
+        .current_dir(repo_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let start = std::time::Instant::now();
+
+    loop {
+        if let Some(status) = child.try_wait()? {
+            if status.success() {
+                return Ok(());
+            }
+            return Err(io::Error::other(format!(
+                "current_dir probe exited with status {status}"
+            )));
+        }
+
+        if start.elapsed() >= Duration::from_secs(MOUNT_READY_SINGLE_PROBE_TIMEOUT_SECS) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "current_dir probe timed out after {}s for {:?}",
+                    MOUNT_READY_SINGLE_PROBE_TIMEOUT_SECS, repo_path
+                ),
+            ));
+        }
+
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+async fn wait_for_repo_mount_ready_with_retry(
+    repo_path: &Path,
+    timeout: Duration,
+    poll_interval: Duration,
+) -> anyhow::Result<()> {
+    let deadline = Instant::now() + timeout;
+    let mut last_error: Option<io::Error> = None;
+
+    loop {
+        let repo_path_buf = repo_path.to_path_buf();
+        let probe_result = tokio::time::timeout(
+            Duration::from_secs(MOUNT_READY_SINGLE_PROBE_TIMEOUT_SECS),
+            tokio::task::spawn_blocking(move || probe_repo_mount(&repo_path_buf)),
+        )
+        .await;
+
+        match probe_result {
+            Ok(Ok(Ok(()))) => {
+                tracing::debug!(repo = ?repo_path, "Mounted repo path is ready");
+                return Ok(());
+            }
+            Ok(Ok(Err(err))) if is_retryable_mount_io_error(&err) => {
+                let timed_out = Instant::now() >= deadline;
+                let raw_code = err.raw_os_error();
+                let should_log = last_error
+                    .as_ref()
+                    .map(|previous| previous.raw_os_error() != raw_code)
+                    .unwrap_or(true);
+
+                if timed_out {
+                    return Err(anyhow!(
+                        "Timed out waiting for mounted repo path {:?} to become ready: {}",
+                        repo_path,
+                        err
+                    ));
+                }
+
+                if should_log {
+                    tracing::warn!(
+                        repo = ?repo_path,
+                        error = %err,
+                        "Mounted repo path is not ready yet; retrying"
+                    );
+                }
+
+                last_error = Some(err);
+                tokio::time::sleep(poll_interval).await;
+            }
+            Ok(Ok(Err(err))) => {
+                return Err(anyhow!(
+                    "Mounted repo path {:?} is not accessible: {}",
+                    repo_path,
+                    err
+                ));
+            }
+            Ok(Err(err)) => {
+                return Err(anyhow!(
+                    "Mounted repo path probe panicked for {:?}: {}",
+                    repo_path,
+                    err
+                ));
+            }
+            Err(_) => {
+                if Instant::now() >= deadline {
+                    return Err(anyhow!(
+                        "Timed out waiting for mounted repo path {:?}: probe exceeded {}s repeatedly",
+                        repo_path,
+                        MOUNT_READY_SINGLE_PROBE_TIMEOUT_SECS
+                    ));
+                }
+
+                tracing::warn!(
+                    repo = ?repo_path,
+                    probe_timeout_secs = MOUNT_READY_SINGLE_PROBE_TIMEOUT_SECS,
+                    "Mounted repo probe timed out; retrying"
+                );
+                tokio::time::sleep(poll_interval).await;
+            }
+        }
+    }
+}
+
+async fn wait_for_repo_mount_ready(repo_path: &Path) -> anyhow::Result<()> {
+    wait_for_repo_mount_ready_with_retry(
+        repo_path,
+        Duration::from_secs(MOUNT_READY_TIMEOUT_SECS),
+        Duration::from_millis(MOUNT_READY_POLL_INTERVAL_MS),
+    )
+    .await
+}
+
 /// Get target of a specific repo under tmp directory.
 fn get_repo_targets(file_name: &str, repo_path: &Path) -> anyhow::Result<Targets> {
     const MAX_ATTEMPTS: usize = 2;
@@ -296,8 +498,8 @@ fn get_repo_targets(file_name: &str, repo_path: &Path) -> anyhow::Result<Targets
         tracing::debug!("Get targets for repo {repo_path:?} (attempt {attempt}/{MAX_ATTEMPTS})");
         let mut command = std::process::Command::new("buck2");
         command
-            .args(targets_arguments())
-            .args(["--isolation-dir", &isolation_dir]);
+            .args(["--isolation-dir", &isolation_dir])
+            .args(targets_arguments());
         command.current_dir(repo_path);
         let (mut child, stdout) = spawn(command)?;
         let mut writer = file_writer(&jsonl_path)?;
@@ -308,9 +510,12 @@ fn get_repo_targets(file_name: &str, repo_path: &Path) -> anyhow::Result<Targets
             .map_err(|err| anyhow!("Failed to flush writer: {}", err))?;
         let status = child.wait()?;
         if status.success() {
-            return Targets::from_file(&jsonl_path);
+            let targets = Targets::from_file(&jsonl_path);
+            cleanup_buck2_daemon(repo_path);
+            return targets;
         }
 
+        cleanup_buck2_daemon(repo_path);
         tracing::warn!(
             "buck2 targets failed with status {} for repo {:?}",
             status,
@@ -583,21 +788,14 @@ impl Drop for MountGuard {
         if self.unmounted.load(Ordering::Acquire) {
             return;
         }
-        // TODO: Temporarily keep mounts alive — skip auto-unmount on drop.
-        // Re-enable the spawn block below once post-build inspection is no longer needed.
-        tracing::info!(
-            "[Task {}] MountGuard dropped but unmount is temporarily disabled (mount_id={}).",
-            self.task_id,
-            self.mount_id,
-        );
-        // let mount_id = self.mount_id.clone();
-        // let task_id: String = self.task_id.clone();
-        // tokio::spawn(async move {
-        //     match unmount_antares_fs(&mount_id).await {
-        //         Ok(_) => tracing::info!("[Task {}] Filesystem unmounted successfully.", task_id),
-        //         Err(e) => tracing::error!("[Task {}] Failed to unmount filesystem: {}", task_id, e),
-        //     }
-        // });
+        let mount_id = self.mount_id.clone();
+        let task_id: String = self.task_id.clone();
+        tokio::spawn(async move {
+            match unmount_antares_fs(&mount_id).await {
+                Ok(_) => tracing::info!("[Task {}] Filesystem unmounted successfully.", task_id),
+                Err(e) => tracing::error!("[Task {}] Failed to unmount filesystem: {}", task_id, e),
+            }
+        });
     }
 }
 
@@ -641,9 +839,8 @@ pub async fn build(
     // Changes are already relative to the sub-project (buck2 project root).
     // Do NOT prefix them with repo_prefix — buck2 runs from the sub-project dir.
 
-    const MAX_TARGETS_ATTEMPTS: usize = 2;
+    const MAX_TARGETS_ATTEMPTS: usize = 3;
     let mut mount_point = None;
-    let mut old_repo_mount_point_saved = None;
     let mut mount_guard = None;
     let mut mount_guard_old_repo = None;
     let mut targets: Vec<TargetLabel> = Vec::new();
@@ -681,6 +878,9 @@ pub async fn build(
         let old_project_root = PathBuf::from(&old_repo_mount_point).join(repo_prefix);
         let new_project_root = PathBuf::from(&repo_mount_point).join(repo_prefix);
 
+        wait_for_repo_mount_ready(&old_project_root).await?;
+        wait_for_repo_mount_ready(&new_project_root).await?;
+
         match get_build_targets(
             old_project_root.to_str().unwrap_or(&old_repo_mount_point),
             new_project_root.to_str().unwrap_or(&repo_mount_point),
@@ -690,7 +890,6 @@ pub async fn build(
         {
             Ok(found_targets) => {
                 mount_point = Some(repo_mount_point);
-                old_repo_mount_point_saved = Some(old_repo_mount_point.clone());
                 mount_guard = Some(guard);
                 mount_guard_old_repo = Some(guard_old_repo);
                 targets = found_targets;
@@ -699,8 +898,9 @@ pub async fn build(
             Err(e) => {
                 guard.unmount().await;
                 guard_old_repo.unmount().await;
+                let retryable = is_retryable_target_discovery_error(&e);
                 last_targets_error = Some(e);
-                if attempt == MAX_TARGETS_ATTEMPTS {
+                if attempt == MAX_TARGETS_ATTEMPTS || !retryable {
                     break;
                 }
                 tracing::warn!(
@@ -825,12 +1025,11 @@ pub async fn build(
             }
         }
 
-        if let Some(status) = exit_status {
-            return Ok(status);
-        }
-
-        let status = child.wait().await?;
-
+        let status = match exit_status {
+            Some(status) => status,
+            None => child.wait().await?,
+        };
+        cleanup_buck2_daemon(&project_root);
         target_build_track.cancellation.cancel();
         let _ = target_build_track.tail_handle.await;
         let _ = target_build_track.process_handle.await;
@@ -839,25 +1038,8 @@ pub async fn build(
     }
     .await;
 
-    // TODO: Temporarily keep mounts alive for debugging / post-build inspection.
-    // Unmount is intentionally skipped here. Remember to re-enable once no longer needed.
-    // mount_guard.unmount().await;
-    // mount_guard_old_repo.unmount().await;
-    tracing::info!(
-        "[Task {}] Skipping unmount — mount directories are retained for inspection: \
-         new_repo mountpoint={}, mount_id={}; \
-         old_repo mountpoint={}, mount_id={}",
-        id,
-        mount_point,
-        mount_guard.mount_id,
-        old_repo_mount_point_saved.as_deref().unwrap_or("<unknown>"),
-        mount_guard_old_repo.mount_id,
-    );
-    // Prevent the Drop impl from unmounting.
-    mount_guard.unmounted.store(true, Ordering::Release);
-    mount_guard_old_repo
-        .unmounted
-        .store(true, Ordering::Release);
+    mount_guard.unmount().await;
+    mount_guard_old_repo.unmount().await;
 
     build_result
 }
@@ -865,12 +1047,108 @@ pub async fn build(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use uuid::Uuid;
+
+    #[test]
+    fn test_retryable_target_discovery_error_detects_fuse_disconnects() {
+        assert!(is_retryable_target_discovery_error(&anyhow!(
+            "Fail to get cells: Transport endpoint is not connected (os error 107)"
+        )));
+        assert!(is_retryable_target_discovery_error(&anyhow!(
+            "buck2 targets failed: Stale file handle (os error 116)"
+        )));
+        assert!(!is_retryable_target_discovery_error(&anyhow!(
+            "logical config mismatch"
+        )));
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_repo_mount_ready_retries_until_dir_exists() {
+        let base = std::env::temp_dir().join(format!("orion-mount-ready-{}", Uuid::new_v4()));
+        let repo_path = base.join("repo");
+        let repo_path_for_task = repo_path.clone();
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            std::fs::create_dir_all(&repo_path_for_task).unwrap();
+            std::fs::write(repo_path_for_task.join(".buckconfig"), b"[repositories]\n").unwrap();
+        });
+
+        wait_for_repo_mount_ready_with_retry(
+            &repo_path,
+            Duration::from_secs(2),
+            Duration::from_millis(10),
+        )
+        .await
+        .unwrap();
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_repo_mount_ready_times_out_for_missing_dir() {
+        let repo_path = std::env::temp_dir()
+            .join(format!("orion-mount-timeout-{}", Uuid::new_v4()))
+            .join("repo");
+
+        let err = wait_for_repo_mount_ready_with_retry(
+            &repo_path,
+            Duration::from_millis(60),
+            Duration::from_millis(10),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("Timed out waiting for mounted repo path")
+        );
+    }
 
     #[tokio::test]
     async fn test_mount_guard_creation() {
         let mount_guard = MountGuard::new("test_mount_id".to_string(), "test_task_id".to_string());
         assert_eq!(mount_guard.mount_id, "test_mount_id");
         assert_eq!(mount_guard.task_id, "test_task_id");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires buck2, /dev/fuse, network access, and SCORPIO_CONFIG"]
+    async fn test_real_mount_waits_until_buck2_cells_succeeds() {
+        if !Path::new("/dev/fuse").exists() {
+            return;
+        }
+        if std::env::var_os("SCORPIO_CONFIG").is_none() {
+            return;
+        }
+
+        let job_id = format!("codex-mount-ready-{}", Uuid::new_v4());
+        let (mountpoint, mount_id) = mount_antares_fs(&job_id, None).await.unwrap();
+        let project_root = PathBuf::from(&mountpoint);
+
+        wait_for_repo_mount_ready(&project_root).await.unwrap();
+
+        let output = std::process::Command::new("timeout")
+            .args([
+                "30s",
+                "buck2",
+                "--isolation-dir",
+                "codex-mount-ready-test",
+                "cells",
+            ])
+            .current_dir(&project_root)
+            .output()
+            .unwrap();
+
+        cleanup_buck2_daemon(&project_root);
+        let _ = unmount_antares_fs(&mount_id).await;
+
+        assert!(
+            output.status.success(),
+            "buck2 cells failed. stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     // Note: mount/unmount tests removed - they now use scorpiofs direct calls

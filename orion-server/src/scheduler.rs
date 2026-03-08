@@ -12,7 +12,7 @@ use api_model::buck2::{
 use chrono::FixedOffset;
 use dashmap::DashMap;
 use rand::Rng;
-use sea_orm::{ActiveModelTrait, ActiveValue::Set, DatabaseConnection, prelude::DateTimeUtc};
+use sea_orm::{DatabaseConnection, EntityTrait, prelude::DateTimeUtc};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, Notify, mpsc::UnboundedSender};
 use utoipa::ToSchema;
@@ -21,12 +21,13 @@ use uuid::Uuid;
 use crate::{
     api::CoreWorkerStatus,
     auto_retry::AutoRetryJudger,
-    log::log_service::LogService,
     model::{
         builds,
         targets::{self, TargetState},
     },
 };
+
+const DEFAULT_LEASE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Request payload for creating a new build task
 #[allow(dead_code)]
@@ -98,6 +99,23 @@ impl TaskQueue {
         Ok(())
     }
 
+    /// Add task-bound build to the front of queue (used by lease recovery).
+    pub fn enqueue_front(&mut self, task: PendingBuildEvent) -> Result<(), String> {
+        if self.queue.len() >= self.config.max_queue_size {
+            return Err("Queue is full".to_string());
+        }
+
+        self.queue.push_front(task);
+        Ok(())
+    }
+
+    /// Check whether queue already has the given build id.
+    pub fn contains_build_id(&self, build_id: Uuid) -> bool {
+        self.queue
+            .iter()
+            .any(|task| task.event_payload.build_event_id == build_id)
+    }
+
     /// Remove task-bound build from the front of queue
     pub fn dequeue(&mut self) -> Option<PendingBuildEvent> {
         self.queue.pop_front()
@@ -124,6 +142,7 @@ impl TaskQueue {
     pub fn get_stats(&self) -> TaskQueueStats {
         TaskQueueStats {
             total_queued: self.queue.len(),
+            leased_builds: 0,
             oldest_task_age_seconds: self
                 .queue
                 .front()
@@ -136,6 +155,7 @@ impl TaskQueue {
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct TaskQueueStats {
     pub total_queued: usize,
+    pub leased_builds: usize,
     /// Age of oldest task in seconds
     pub oldest_task_age_seconds: Option<u64>,
 }
@@ -172,6 +192,13 @@ pub struct BuildInfo {
     pub auto_retry_judger: AutoRetryJudger,
     #[allow(dead_code)]
     pub worker_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct LeasedBuild {
+    pub worker_id: String,
+    pub pending_build_event: PendingBuildEvent,
+    pub leased_at: Instant,
 }
 
 impl BuildEventPayload {
@@ -239,6 +266,10 @@ pub struct TaskScheduler {
     pub workers: Arc<DashMap<String, WorkerInfo>>,
     /// Active build tasks
     pub active_builds: Arc<DashMap<String, BuildInfo>>,
+    /// Build tasks that have been dispatched but not yet acknowledged by worker
+    pub leased_builds: Arc<DashMap<String, LeasedBuild>>,
+    /// Lease timeout for unacknowledged builds
+    pub lease_timeout: Duration,
     /// Database connection
     pub conn: DatabaseConnection,
 }
@@ -267,11 +298,20 @@ impl TaskScheduler {
         queue_config: Option<TaskQueueConfig>,
     ) -> Self {
         let config = queue_config.unwrap_or_default();
+        let lease_timeout = std::env::var("ORION_LEASE_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .map(Duration::from_secs)
+            .unwrap_or(DEFAULT_LEASE_TIMEOUT);
+
         Self {
             pending_tasks: Arc::new(Mutex::new(TaskQueue::new(config))),
             task_notifier: Arc::new(Notify::new()),
             workers,
             active_builds,
+            leased_builds: Arc::new(DashMap::new()),
+            lease_timeout,
             conn,
         }
     }
@@ -327,23 +367,57 @@ impl TaskScheduler {
         target_path: String,
         retry_count: i32,
     ) -> Result<(), String> {
+        let build_id_str = build_event_id.to_string();
+
+        if self.active_builds.contains_key(&build_id_str)
+            || self.leased_builds.contains_key(&build_id_str)
+        {
+            return Err(format!("Build {} is already in-flight", build_event_id));
+        }
+
+        {
+            let queue = self.pending_tasks.lock().await;
+            if queue.contains_build_id(build_event_id) {
+                return Err(format!("Build {} is already queued", build_event_id));
+            }
+        }
+
         // TODO: replace with the new target model
         let target_model = self
             .ensure_target(task_id, &target_path)
             .await
             .map_err(|e| e.to_string())?;
+
+        // Persist build before queueing so duplicate submissions can be resolved idempotently.
+        if builds::Entity::find_by_id(build_event_id)
+            .one(&self.conn)
+            .await
+            .map_err(|e| e.to_string())?
+            .is_none()
+        {
+            builds::Model::insert_build(
+                build_event_id,
+                task_id,
+                target_model.id,
+                repo.clone(),
+                &self.conn,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        }
+
         let event = BuildEventPayload::new(
             build_event_id,
             task_id,
             cl_link.to_string(),
-            repo.clone(),
+            repo,
             retry_count,
         );
 
         let pending_build_event = PendingBuildEvent {
             event_payload: event,
-            target_id: target_model.id.into(),
-            target_path: target_path.into(),
+            target_id: Some(target_model.id),
+            target_path: Some(target_path),
             changes,
             created_at: Instant::now(),
         };
@@ -353,7 +427,7 @@ impl TaskScheduler {
             queue.enqueue(pending_build_event)?;
         }
 
-        // Notify that there's a new task to process
+        // Notify that there is a new task to process
         self.task_notifier.notify_one();
         Ok(())
     }
@@ -361,13 +435,130 @@ impl TaskScheduler {
     /// Get queue statistics
     pub async fn get_queue_stats(&self) -> TaskQueueStats {
         let queue = self.pending_tasks.lock().await;
-        queue.get_stats()
+        let mut stats = queue.get_stats();
+        stats.leased_builds = self.leased_builds.len();
+        stats
     }
 
     /// Clean up expired task-bound builds
     pub async fn cleanup_expired_tasks(&self) -> Vec<PendingBuildEvent> {
         let mut queue = self.pending_tasks.lock().await;
         queue.cleanup_expired()
+    }
+
+    pub async fn is_build_queued(&self, build_id: Uuid) -> bool {
+        let queue = self.pending_tasks.lock().await;
+        queue.contains_build_id(build_id)
+    }
+
+    pub fn is_build_leased(&self, build_id: &str) -> bool {
+        self.leased_builds.contains_key(build_id)
+    }
+
+    pub fn clear_lease(&self, build_id: &str) {
+        self.leased_builds.remove(build_id);
+    }
+
+    pub fn register_lease(&self, worker_id: String, pending_build_event: PendingBuildEvent) {
+        self.leased_builds.insert(
+            pending_build_event.event_payload.build_event_id.to_string(),
+            LeasedBuild {
+                worker_id,
+                pending_build_event,
+                leased_at: Instant::now(),
+            },
+        );
+    }
+
+    pub async fn on_task_ack(&self, worker_id: &str, build_id: &str, success: bool, message: &str) {
+        if success {
+            if self.leased_builds.remove(build_id).is_some() {
+                tracing::info!(
+                    "Build {} acknowledged by worker {} and lease is cleared.",
+                    build_id,
+                    worker_id
+                );
+            }
+            return;
+        }
+
+        tracing::warn!(
+            "Build {} was rejected by worker {}. message={}",
+            build_id,
+            worker_id,
+            message
+        );
+
+        if let Some((_, lease)) = self.leased_builds.remove(build_id) {
+            self.active_builds.remove(build_id);
+
+            if let Some(mut worker) = self.workers.get_mut(worker_id)
+                && let WorkerStatus::Busy {
+                    build_id: busy_build,
+                    ..
+                } = &worker.status
+                && busy_build == build_id
+            {
+                worker.status = WorkerStatus::Idle;
+            }
+
+            let mut queue = self.pending_tasks.lock().await;
+            if let Err(err) = queue.enqueue_front(lease.pending_build_event.clone()) {
+                tracing::error!("Failed to requeue rejected build {}: {}", build_id, err);
+            } else {
+                tracing::warn!(
+                    "Build {} has been requeued after rejection by worker {}.",
+                    build_id,
+                    worker_id
+                );
+                self.task_notifier.notify_one();
+            }
+        }
+    }
+
+    pub async fn reclaim_expired_leases(&self) -> usize {
+        let now = Instant::now();
+        let mut expired_ids = Vec::new();
+
+        for entry in self.leased_builds.iter() {
+            if now.duration_since(entry.value().leased_at) >= self.lease_timeout {
+                expired_ids.push(entry.key().clone());
+            }
+        }
+
+        let mut reclaimed = 0;
+        for build_id in expired_ids {
+            if let Some((_, lease)) = self.leased_builds.remove(&build_id) {
+                tracing::warn!(
+                    "Build {} lease expired after {:?}; requeueing task.",
+                    build_id,
+                    self.lease_timeout
+                );
+
+                self.active_builds.remove(&build_id);
+
+                if let Some(mut worker) = self.workers.get_mut(&lease.worker_id)
+                    && let WorkerStatus::Busy {
+                        build_id: busy_build,
+                        ..
+                    } = &worker.status
+                    && busy_build == &build_id
+                {
+                    worker.status = WorkerStatus::Idle;
+                }
+
+                let mut queue = self.pending_tasks.lock().await;
+                if queue.enqueue_front(lease.pending_build_event).is_ok() {
+                    reclaimed += 1;
+                }
+            }
+        }
+
+        if reclaimed > 0 {
+            self.task_notifier.notify_one();
+        }
+
+        reclaimed
     }
 
     /// Check if there are available workers
@@ -491,48 +682,32 @@ impl TaskScheduler {
             started_at: start_at,
         };
 
-        // Insert build record (fail fast if insertion fails)
-        if let Err(e) = (builds::ActiveModel {
-            id: Set(pending_build_event.event_payload.build_event_id),
-            task_id: Set(pending_build_event.event_payload.task_id),
-            // target_id: Set(pending_build_event.target_id),
-            target_id: Set(Uuid::nil()),
-            exit_code: Set(None),
-            start_at: Set(start_at_tz),
-            end_at: Set(None),
-            repo: Set(build_info.event_payload.repo.clone()),
-            args: Set(None),
-            output_file: Set(format!(
-                "{}/{}/{}.log",
-                pending_build_event.event_payload.task_id,
-                LogService::last_segment(&pending_build_event.event_payload.repo),
-                pending_build_event.event_payload.build_event_id
-            )),
-            created_at: Set(start_at_tz),
-            retry_count: Set(0),
-        })
-        .insert(&self.conn)
-        .await
-        {
-            tracing::error!(
-                "Failed to insert build {} for task {}: {}",
-                pending_build_event.event_payload.build_event_id,
-                pending_build_event.event_payload.task_id,
-                e
-            );
-            return Err(format!(
-                "Failed to insert build {}",
-                pending_build_event.event_payload.build_event_id
-            ));
-        }
+        let build_id = pending_build_event.event_payload.build_event_id;
+        let build_id_str = build_id.to_string();
 
-        println!("insert build");
+        // Ensure build record exists (queueing path persists first, lease recovery may re-dispatch).
+        if builds::Entity::find_by_id(build_id)
+            .one(&self.conn)
+            .await
+            .map_err(|e| e.to_string())?
+            .is_none()
+        {
+            builds::Model::insert_build(
+                build_id,
+                pending_build_event.event_payload.task_id,
+                pending_build_event.target_id.unwrap_or(Uuid::nil()),
+                pending_build_event.event_payload.repo.clone(),
+                &self.conn,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        }
 
         // Create WebSocket message
         let msg = WSMessage::TaskBuild {
-            build_id: pending_build_event.event_payload.build_event_id.to_string(),
-            repo: pending_build_event.event_payload.repo,
-            cl_link: pending_build_event.event_payload.cl_link.to_string(),
+            build_id: build_id_str.clone(),
+            repo: pending_build_event.event_payload.repo.clone(),
+            cl_link: pending_build_event.event_payload.cl_link.clone(),
             changes: pending_build_event.changes.clone(),
         };
 
@@ -542,7 +717,6 @@ impl TaskScheduler {
                 // Only mark Building after send succeeds
                 if let Err(e) = targets::update_state(
                     &self.conn,
-                    //TODO: update target_id here
                     pending_build_event.target_id.unwrap_or(Uuid::nil()),
                     TargetState::Building,
                     Some(start_at_tz),
@@ -555,17 +729,16 @@ impl TaskScheduler {
                 }
 
                 worker.status = WorkerStatus::Busy {
-                    build_id: pending_build_event.event_payload.build_event_id.to_string(),
+                    build_id: build_id_str.clone(),
                     phase: None,
                 };
-                self.active_builds.insert(
-                    pending_build_event.event_payload.build_event_id.to_string(),
-                    build_info,
-                );
+                self.active_builds.insert(build_id_str.clone(), build_info);
+                self.register_lease(chosen_id.clone(), pending_build_event.clone());
+
                 tracing::info!(
-                    "Queued task {}/{} dispatched to worker {}",
+                    "Queued task {}/{} dispatched to worker {} (lease started)",
                     pending_build_event.event_payload.task_id,
-                    pending_build_event.event_payload.build_event_id,
+                    build_id,
                     chosen_id
                 );
                 Ok(())
@@ -573,7 +746,6 @@ impl TaskScheduler {
                 // Send failed: best-effort mark target back to Pending
                 let _ = targets::update_state(
                     &self.conn,
-                    // TODO: update target_id here
                     pending_build_event.target_id.unwrap_or(Uuid::nil()),
                     TargetState::Pending,
                     Some(start_at_tz),
@@ -648,6 +820,22 @@ impl TaskScheduler {
             }
         });
 
+        // Lease reclaimer: recover tasks that were dispatched but never acknowledged.
+        let lease_scheduler = self.clone();
+        let lease_task = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(3));
+            loop {
+                interval.tick().await;
+                let reclaimed = lease_scheduler.reclaim_expired_leases().await;
+                if reclaimed > 0 {
+                    tracing::warn!(
+                        "Recovered {} expired leases and requeued corresponding tasks",
+                        reclaimed
+                    );
+                }
+            }
+        });
+
         // Wait for tasks to complete (actually runs forever)
         tokio::select! {
             _ = dispatch_task => {
@@ -655,6 +843,9 @@ impl TaskScheduler {
             }
             _ = cleanup_task => {
                 tracing::error!("Task cleanup unexpectedly stopped");
+            }
+            _ = lease_task => {
+                tracing::error!("Lease recovery unexpectedly stopped");
             }
         }
     }
@@ -711,14 +902,14 @@ mod tests {
             dequeued1.event_payload.build_event_id,
             task1.event_payload.build_event_id
         );
-        assert_eq!(dequeued1.event_payload.repo, "/test/repo");
+        assert_eq!(dequeued1.event_payload.repo, "test/repo");
 
         let dequeued2 = queue.dequeue().unwrap();
         assert_eq!(
             dequeued2.event_payload.build_event_id,
             task2.event_payload.build_event_id
         );
-        assert_eq!(dequeued2.event_payload.repo, "/test2/repo");
+        assert_eq!(dequeued2.event_payload.repo, "test2/repo");
     }
 
     /// Test queue capacity limit
@@ -752,5 +943,76 @@ mod tests {
 
         // Should fail when full
         assert!(queue.enqueue(task).is_err());
+    }
+
+    #[test]
+    fn test_enqueue_front_priority() {
+        let config = TaskQueueConfig::default();
+        let mut queue = TaskQueue::new(config);
+
+        let first = PendingBuildEvent {
+            event_payload: BuildEventPayload::new(
+                Uuid::now_v7(),
+                Uuid::now_v7(),
+                "cl1".to_string(),
+                "repo1".to_string(),
+                0,
+            ),
+            target_id: Some(Uuid::now_v7()),
+            target_path: Some("//:one".to_string()),
+            changes: vec![],
+            created_at: Instant::now(),
+        };
+
+        let urgent = PendingBuildEvent {
+            event_payload: BuildEventPayload::new(
+                Uuid::now_v7(),
+                Uuid::now_v7(),
+                "cl2".to_string(),
+                "repo2".to_string(),
+                0,
+            ),
+            target_id: Some(Uuid::now_v7()),
+            target_path: Some("//:two".to_string()),
+            changes: vec![],
+            created_at: Instant::now(),
+        };
+
+        queue.enqueue(first.clone()).unwrap();
+        queue.enqueue_front(urgent.clone()).unwrap();
+
+        assert_eq!(
+            queue.dequeue().unwrap().event_payload.build_event_id,
+            urgent.event_payload.build_event_id
+        );
+        assert_eq!(
+            queue.dequeue().unwrap().event_payload.build_event_id,
+            first.event_payload.build_event_id
+        );
+    }
+
+    #[test]
+    fn test_contains_build_id() {
+        let config = TaskQueueConfig::default();
+        let mut queue = TaskQueue::new(config);
+
+        let build_id = Uuid::now_v7();
+        let task = PendingBuildEvent {
+            event_payload: BuildEventPayload::new(
+                build_id,
+                Uuid::now_v7(),
+                "cl".to_string(),
+                "repo".to_string(),
+                0,
+            ),
+            target_id: Some(Uuid::now_v7()),
+            target_path: Some("//:target".to_string()),
+            changes: vec![],
+            created_at: Instant::now(),
+        };
+
+        assert!(!queue.contains_build_id(build_id));
+        queue.enqueue(task).unwrap();
+        assert!(queue.contains_build_id(build_id));
     }
 }

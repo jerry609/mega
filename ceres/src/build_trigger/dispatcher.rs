@@ -44,6 +44,7 @@ impl BuildDispatcher {
                 })?;
 
             let req = TaskBuildRequest {
+                build_id: None,
                 repo: repo.to_string(),
                 cl_link: cl_link.to_string(),
                 cl_id: cl_id.unwrap_or(0),

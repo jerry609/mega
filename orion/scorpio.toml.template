@@ -18,6 +18,7 @@ antares_upper_root = "/var/lib/scorpio/antares/upper"
 antares_cl_root = "/var/lib/scorpio/antares/cl"
 antares_mount_root = "/var/lib/scorpio/antares/mnt"
 antares_state_file = "/var/lib/scorpio/antares/state.toml"
+config_file = "config.toml"
 
 # Preload depth
 antares_load_dir_depth = "3"
