@@ -2383,3 +2383,141 @@ Transport endpoint is not connected (os error 107)
 - 把 mount readiness 从“文件系统探测”升级为“明确的 ready 信号/health probe”；
 - 给 Antares mount / buck2 cells / buck2 build 增加分层指标（mount latency / mount probe retries / cells retry count）；
 - 对 worker 重连后 lease reclaim + in-flight build 去重补一轮端到端回归。
+
+
+## 二十、2026-03-08 新问题：Buck2 daemon advisory lock I/O error
+
+### 1) 现象
+
+在真实 FUSE 挂载环境里，`buck2` 不再只报 `ENOTCONN`，而是进一步出现：
+
+```text
+Error initializing DaemonStateData
+
+disk I/O error
+Error code 3850: I/O error in the advisory file locking layer
+```
+
+这个报错发生在 target discovery 早期阶段，不一定要等到真正执行 build：
+
+- `buck2 audit cell --json --reuse-current-config`
+- `buck2 audit config --reuse-current-config`
+- `buck2 targets ...`
+- `buck2 build ...`
+
+都可能在初始化 daemon/materializer state 时被同一类锁错误卡住。
+
+### 2) 排查结论
+
+#### A. 之前 ignored test 的“跑满 60 秒像挂死”主要是测试自身把 tokio runtime 卡住了
+
+旧版 `test_real_mount_waits_until_buck2_cells_succeeds` 使用：
+
+- 默认 `#[tokio::test]`
+- `std::process::Command::output()`
+
+这会在单线程 runtime 上同步阻塞，导致 FUSE session 拿不到调度时间，表现出来就像“挂载后某些访问直接卡住”。
+
+这一层已经先修掉：
+
+- 测试改为 `#[tokio::test(flavor = "multi_thread", worker_threads = 2)]`
+- Buck2 命令改为 `tokio::process::Command`
+
+因此，之前那次 60 秒超时不能直接当作 host/FUSE 真正 deadlock 的证据。
+
+#### B. 真正触发 `Error code 3850` 的根因，是 Buck2 可写状态落在 FUSE 挂载 repo 的 `buck-out`
+
+失败现场里，可以直接在 FUSE upper 层看到 Buck2 的 SQLite 状态文件，例如：
+
+- `/tmp/megadir/antares/upper/3859a9d0-420c-41b4-acfe-0ad3f3c5d0e9/buck-out/codex-mount-ready-test/cache/materializer_state/db.sqlite`
+
+结合失败日志里的：
+
+```text
+Error initializing DaemonStateData
+Error code 3850: I/O error in the advisory file locking layer
+```
+
+可以基本确认：
+
+- Buck2 daemon/materializer/incremental state 的锁文件和 SQLite 数据落在 mounted repo 的 `buck-out`
+- 这个 `buck-out` 实际位于 scorpiofs/FUSE overlay upper layer
+- advisory lock 在这层文件系统上不稳定，最终变成 SQLite 的 I/O / locking error
+
+换句话说，这不是单纯的 `audit cell` 命令问题，而是 **所有会初始化同一个 daemon state 的 Buck2 子命令** 都可能撞到同一把锁。
+
+### 3) 修复策略
+
+修复思路不是禁用 target discovery，而是把 Buck2 的可写状态从 FUSE 挂载层挪走。
+
+本轮在 `orion/src/buck_controller.rs` 增加了本地 `buck-out` 方案：
+
+- 新增固定根目录：`/tmp/orion-buck-out`
+- 针对每个 mounted repo，根据 repo path 计算稳定 hash
+- 在真正执行 Buck2 前，为 mounted repo 创建：
+  - `repo/buck-out -> /tmp/orion-buck-out/buck-out-<hash>`
+- target discovery 失败重试、build 结束、mount 回收时都清理对应 symlink 和本地目录
+
+这样做之后：
+
+- 源码读取仍然走 FUSE 挂载
+- Buck2 daemon/materializer/incremental state 落到宿主机普通文件系统
+- advisory lock 不再依赖 FUSE upper layer
+
+### 4) 分阶段验证结果
+
+ignored 环境测试也同步扩展成分阶段验证，按顺序执行：
+
+1. `buck2 audit cell --json --reuse-current-config`
+2. `buck2 audit config --reuse-current-config`
+3. `buck2 targets prelude//platforms:default --json-lines`
+4. `buck2 build prelude//platforms:default`
+
+并且所有命令都显式使用同一个 isolation dir：`codex-mount-ready-test`。
+
+成功日志显示，修复后 mounted repo 会先准备本地 `buck-out`，例如：
+
+- `/tmp/orion-buck-out/buck-out-ed9aee1b91b59c9d`
+- `/tmp/orion-buck-out/buck-out-d5c924083a512886`
+
+随后真实环境测试通过：
+
+- `cargo test -p orion --lib -- --nocapture`
+  - 结果：`38 passed; 1 ignored`
+- `cargo test -p orion test_real_mount_waits_until_buck2_cells_succeeds -- --ignored --nocapture`
+  - 结果：通过
+  - 最新成功样例耗时约 `3.62s`
+
+这说明：
+
+- `audit cell`
+- `audit config`
+- `targets`
+- `build`
+
+都没有再被同一个 daemon lock / advisory lock I/O error 卡住。
+
+### 5) 与前一轮 ENOTCONN 问题的关系
+
+前一轮文档里的 `Transport endpoint is not connected (os error 107)` 仍然是需要防守的一类 FUSE 瞬时错误，所以 `wait_for_repo_mount_ready()` 和 target discovery retry 仍然保留。
+
+但从这次实测看，修复本地 `buck-out` 之后：
+
+- 没有再复现 `Error code 3850`
+- 也没有在 `audit cell / audit config / targets / build` 阶段复现新的 `ENOTCONN`
+
+因此，当前更明确的结论是：
+
+- `ENOTCONN` 负责的是“挂载刚 ready 时的可访问性窗口”
+- `Error code 3850` 负责的是“Buck2 daemon state 落在 FUSE `buck-out` 上导致锁层 I/O 异常”
+
+两者属于同一链路里的不同层次问题，本轮已经分别做了处理。
+
+### 6) 剩余风险与后续建议
+
+当前修复已经把最稳定可复现的 Buck2 daemon 锁问题绕开，但如果线上还出现“某些访问直接卡住”的现象，后续要继续沿宿主机/FUSE/scorpiofs 这层排查：
+
+- 给 mount readiness 增加更明确的 health probe，而不只是目录探测
+- 观测挂载后首次 `lookup/open/read` 的耗时与失败率
+- 区分 `source tree 读取问题` 与 `buck-out 写状态问题`
+- 若后续仍出现 daemon 级异常，可继续评估更强的隔离目录策略，或在极端场景下进一步限制 daemon 复用

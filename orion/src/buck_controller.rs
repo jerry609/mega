@@ -41,6 +41,7 @@ const FLUSH_INTERVAL_MS: u64 = 100;
 const MOUNT_READY_TIMEOUT_SECS: u64 = 15;
 const MOUNT_READY_POLL_INTERVAL_MS: u64 = 200;
 const MOUNT_READY_SINGLE_PROBE_TIMEOUT_SECS: u64 = 2;
+const LOCAL_BUCK_OUT_ROOT: &str = "/tmp/orion-buck-out";
 
 #[allow(dead_code)]
 static PROJECT_ROOT: Lazy<String> =
@@ -326,6 +327,87 @@ fn cleanup_buck2_daemon(repo_path: &Path) {
                 err
             );
         }
+    }
+}
+
+fn local_buck_out_dir(repo_path: &Path) -> anyhow::Result<PathBuf> {
+    let digest = ring::digest::digest(
+        &ring::digest::SHA256,
+        repo_path.to_string_lossy().as_bytes(),
+    );
+    let suffix = &hex::encode(digest.as_ref())[..16];
+    Ok(PathBuf::from(LOCAL_BUCK_OUT_ROOT).join(format!("buck-out-{suffix}")))
+}
+
+fn ensure_local_buck_out(repo_path: &Path) -> anyhow::Result<PathBuf> {
+    use std::os::unix::fs::symlink;
+
+    let mounted_buck_out = repo_path.join("buck-out");
+    let local_buck_out = local_buck_out_dir(repo_path)?;
+
+    std::fs::create_dir_all(&local_buck_out)?;
+
+    match std::fs::symlink_metadata(&mounted_buck_out) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            let current_target = std::fs::read_link(&mounted_buck_out)?;
+            if current_target == local_buck_out {
+                return Ok(local_buck_out);
+            }
+            return Err(anyhow!(
+                "Mounted repo {:?} already has buck-out symlink {:?}, expected {:?}",
+                repo_path,
+                current_target,
+                local_buck_out,
+            ));
+        }
+        Ok(_) => {
+            return Err(anyhow!(
+                "Mounted repo {:?} already has non-symlink buck-out at {:?}",
+                repo_path,
+                mounted_buck_out,
+            ));
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err.into()),
+    }
+
+    symlink(&local_buck_out, &mounted_buck_out)?;
+    tracing::info!(
+        repo = ?repo_path,
+        local_buck_out = ?local_buck_out,
+        "Prepared local buck-out symlink for mounted repo"
+    );
+    Ok(local_buck_out)
+}
+
+fn cleanup_local_buck_out(repo_path: &Path) {
+    let Ok(local_buck_out) = local_buck_out_dir(repo_path) else {
+        return;
+    };
+
+    let mounted_buck_out = repo_path.join("buck-out");
+    if let Ok(metadata) = std::fs::symlink_metadata(&mounted_buck_out)
+        && metadata.file_type().is_symlink()
+    {
+        if let Err(err) = std::fs::remove_file(&mounted_buck_out) {
+            tracing::debug!(
+                repo = ?repo_path,
+                path = ?mounted_buck_out,
+                error = %err,
+                "Failed to remove mounted buck-out symlink"
+            );
+        }
+    }
+
+    if let Err(err) = std::fs::remove_dir_all(&local_buck_out)
+        && err.kind() != io::ErrorKind::NotFound
+    {
+        tracing::debug!(
+            repo = ?repo_path,
+            path = ?local_buck_out,
+            error = %err,
+            "Failed to remove local buck-out directory"
+        );
     }
 }
 
@@ -843,6 +925,7 @@ pub async fn build(
     let mut mount_point = None;
     let mut mount_guard = None;
     let mut mount_guard_old_repo = None;
+    let mut old_project_root_saved = None;
     let mut targets: Vec<TargetLabel> = Vec::new();
     let mut last_targets_error: Option<anyhow::Error> = None;
 
@@ -880,6 +963,8 @@ pub async fn build(
 
         wait_for_repo_mount_ready(&old_project_root).await?;
         wait_for_repo_mount_ready(&new_project_root).await?;
+        ensure_local_buck_out(&old_project_root)?;
+        ensure_local_buck_out(&new_project_root)?;
 
         match get_build_targets(
             old_project_root.to_str().unwrap_or(&old_repo_mount_point),
@@ -889,6 +974,7 @@ pub async fn build(
         .await
         {
             Ok(found_targets) => {
+                old_project_root_saved = Some(old_project_root.clone());
                 mount_point = Some(repo_mount_point);
                 mount_guard = Some(guard);
                 mount_guard_old_repo = Some(guard_old_repo);
@@ -896,6 +982,8 @@ pub async fn build(
                 break;
             }
             Err(e) => {
+                cleanup_local_buck_out(&new_project_root);
+                cleanup_local_buck_out(&old_project_root);
                 guard.unmount().await;
                 guard_old_repo.unmount().await;
                 let retryable = is_retryable_target_discovery_error(&e);
@@ -939,6 +1027,8 @@ pub async fn build(
     let mount_guard = mount_guard.ok_or("Mount guard missing after target discovery")?;
     let mount_guard_old_repo =
         mount_guard_old_repo.ok_or("Old repo mount guard missing after target discovery")?;
+    let old_project_root =
+        old_project_root_saved.ok_or("Old repo project root missing after target discovery")?;
 
     let build_result = async {
         // Run buck2 build from the sub-project directory, not the monorepo root.
@@ -1038,6 +1128,9 @@ pub async fn build(
     }
     .await;
 
+    let new_project_root = PathBuf::from(&mount_point).join(repo_prefix);
+    cleanup_local_buck_out(&new_project_root);
+    cleanup_local_buck_out(&old_project_root);
     mount_guard.unmount().await;
     mount_guard_old_repo.unmount().await;
 
@@ -1048,6 +1141,27 @@ pub async fn build(
 mod tests {
     use super::*;
     use uuid::Uuid;
+
+    #[test]
+    fn test_ensure_local_buck_out_creates_symlink() {
+        let repo_path =
+            std::env::temp_dir().join(format!("orion-local-buck-out-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&repo_path).unwrap();
+
+        let local_buck_out = ensure_local_buck_out(&repo_path).unwrap();
+        let mounted_buck_out = repo_path.join("buck-out");
+
+        assert!(local_buck_out.exists());
+        let metadata = std::fs::symlink_metadata(&mounted_buck_out).unwrap();
+        assert!(metadata.file_type().is_symlink());
+        assert_eq!(
+            std::fs::read_link(&mounted_buck_out).unwrap(),
+            local_buck_out
+        );
+
+        cleanup_local_buck_out(&repo_path);
+        std::fs::remove_dir_all(&repo_path).unwrap();
+    }
 
     #[test]
     fn test_retryable_target_discovery_error_detects_fuse_disconnects() {
@@ -1115,6 +1229,22 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "requires buck2, /dev/fuse, network access, and SCORPIO_CONFIG"]
     async fn test_real_mount_waits_until_buck2_cells_succeeds() {
+        async fn run_buck2_command(
+            repo_path: &Path,
+            timeout_secs: u64,
+            args: &[&str],
+        ) -> std::process::Output {
+            tokio::process::Command::new("timeout")
+                .kill_on_drop(true)
+                .arg(format!("{timeout_secs}s"))
+                .arg("buck2")
+                .args(args)
+                .current_dir(repo_path)
+                .output()
+                .await
+                .unwrap()
+        }
+
         if !Path::new("/dev/fuse").exists() {
             return;
         }
@@ -1125,34 +1255,123 @@ mod tests {
         let job_id = format!("codex-mount-ready-{}", Uuid::new_v4());
         let (mountpoint, mount_id) = mount_antares_fs(&job_id, None).await.unwrap();
         let project_root = PathBuf::from(&mountpoint);
+        let isolation_dir = "codex-mount-ready-test";
 
         wait_for_repo_mount_ready(&project_root).await.unwrap();
+        ensure_local_buck_out(&project_root).unwrap();
 
-        let output = tokio::process::Command::new("timeout")
-            .kill_on_drop(true)
-            .args([
-                "30s",
-                "buck2",
+        let audit_cells = run_buck2_command(
+            &project_root,
+            120,
+            &[
                 "--isolation-dir",
-                "codex-mount-ready-test",
+                isolation_dir,
                 "audit",
                 "cell",
                 "--json",
                 "--reuse-current-config",
-            ])
-            .current_dir(&project_root)
-            .output()
-            .await
-            .unwrap();
+            ],
+        )
+        .await;
+
+        let audit_config = if audit_cells.status.success() {
+            Some(
+                run_buck2_command(
+                    &project_root,
+                    120,
+                    &[
+                        "--isolation-dir",
+                        isolation_dir,
+                        "audit",
+                        "config",
+                        "--reuse-current-config",
+                    ],
+                )
+                .await,
+            )
+        } else {
+            None
+        };
+
+        let targets = if audit_config
+            .as_ref()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+        {
+            Some(
+                run_buck2_command(
+                    &project_root,
+                    120,
+                    &[
+                        "--isolation-dir",
+                        isolation_dir,
+                        "targets",
+                        "prelude//platforms:default",
+                        "--json-lines",
+                    ],
+                )
+                .await,
+            )
+        } else {
+            None
+        };
+
+        let build_output = if targets
+            .as_ref()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+        {
+            Some(
+                run_buck2_command(
+                    &project_root,
+                    120,
+                    &[
+                        "--isolation-dir",
+                        isolation_dir,
+                        "build",
+                        "prelude//platforms:default",
+                    ],
+                )
+                .await,
+            )
+        } else {
+            None
+        };
 
         cleanup_buck2_daemon(&project_root);
+        cleanup_local_buck_out(&project_root);
         let _ = unmount_antares_fs(&mount_id).await;
 
         assert!(
-            output.status.success(),
+            audit_cells.status.success(),
             "buck2 audit cell failed. stdout={} stderr={}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+            String::from_utf8_lossy(&audit_cells.stdout),
+            String::from_utf8_lossy(&audit_cells.stderr)
+        );
+
+        let audit_config =
+            audit_config.expect("buck2 audit config was skipped after audit cell failure");
+        assert!(
+            audit_config.status.success(),
+            "buck2 audit config failed. stdout={} stderr={}",
+            String::from_utf8_lossy(&audit_config.stdout),
+            String::from_utf8_lossy(&audit_config.stderr)
+        );
+
+        let targets = targets.expect("buck2 targets was skipped after audit config failure");
+        assert!(
+            targets.status.success(),
+            "buck2 targets failed. stdout={} stderr={}",
+            String::from_utf8_lossy(&targets.stdout),
+            String::from_utf8_lossy(&targets.stderr)
+        );
+
+        let build_output = build_output.expect("buck2 build was skipped after targets failure");
+        assert!(
+            build_output.status.success(),
+            "buck2 build failed. stdout={} stderr={}",
+            String::from_utf8_lossy(&build_output.stdout),
+            String::from_utf8_lossy(&build_output.stderr)
         );
     }
 
