@@ -1112,7 +1112,7 @@ mod tests {
         assert_eq!(mount_guard.task_id, "test_task_id");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "requires buck2, /dev/fuse, network access, and SCORPIO_CONFIG"]
     async fn test_real_mount_waits_until_buck2_cells_succeeds() {
         if !Path::new("/dev/fuse").exists() {
@@ -1128,16 +1128,21 @@ mod tests {
 
         wait_for_repo_mount_ready(&project_root).await.unwrap();
 
-        let output = std::process::Command::new("timeout")
+        let output = tokio::process::Command::new("timeout")
+            .kill_on_drop(true)
             .args([
                 "30s",
                 "buck2",
                 "--isolation-dir",
                 "codex-mount-ready-test",
-                "cells",
+                "audit",
+                "cell",
+                "--json",
+                "--reuse-current-config",
             ])
             .current_dir(&project_root)
             .output()
+            .await
             .unwrap();
 
         cleanup_buck2_daemon(&project_root);
@@ -1145,7 +1150,7 @@ mod tests {
 
         assert!(
             output.status.success(),
-            "buck2 cells failed. stdout={} stderr={}",
+            "buck2 audit cell failed. stdout={} stderr={}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
