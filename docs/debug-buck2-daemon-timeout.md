@@ -3120,3 +3120,360 @@ orion/src/
 ```
 90bb42f1 refactor(orion): remove dead code
 ```
+
+
+## Part 10: ENOTCONN 分层根因 + Scorpiofs 上游代码检查 (2026-03-09)
+
+### 1) 这次 `os error 107` 到底是什么意思
+
+Orion 报错：
+
+```text
+Error getting build targets: Fail to get cells: Transport endpoint is not connected (os error 107)
+```
+
+这不是 Buck2 自己的业务错误，而是 Linux/FUSE 典型错误 `ENOTCONN`：
+
+- 路径看起来还在
+- 但背后的 FUSE userspace session 并没有成功服务这次请求
+- 对上层调用者来说，就表现为“挂载点还在，但访问已经断了/还没真正 ready”
+
+结合现场位置，这个错误发生在 target discovery 很早阶段：
+
+- `buck2 audit cell`
+- `buck2 audit config`
+- `buck2 targets`
+
+说明问题在“挂载完成后的可访问性语义”，而不是 build 执行后期。
+
+### 2) 基于 Scorpiofs 上游代码检查的结论
+
+我在本地单独 clone 了上游仓库并检查实现：
+
+- 仓库：`/Users/jerry/Desktop/scorpiofs`
+- 上游 tag：`v0.1.1`
+- 当前 HEAD：`2ac3178`
+
+本轮代码检查后，对 `ENOTCONN` 的结论是：**Scorpiofs 当前更偏向“尽快返回 mount 成功”，但对 Buck2 这种重路径遍历调用来说，当前 ready 语义还不够强。**
+
+#### A. `mount()` 返回得比“深层目录稳定可访问”更早
+
+在 `scorpiofs/src/antares/fuse.rs` 里，`mount()` 的行为是：
+
+- 启动 FUSE session
+- 把 handle 丢到后台 task
+- 然后立即返回成功
+
+日志里还明确写着：
+
+- `Mount spawned for ...; FUSE session running (Dicfuse may still be loading in background)`
+
+这说明当前 mount 成功更接近：
+
+- “session 已 spawn”
+
+而不是：
+
+- “repo subtree 已经足够稳定，可以直接给 Buck2 做 audit/targets/build 这种重访问”
+
+#### B. Scorpiofs 自己的测试代码也承认 mount 返回后还有 readiness 窗口
+
+在 `scorpiofs/src/antares/fuse.rs` 的测试辅助代码里，已经直接写了：
+
+- `FUSE mounts can become ready slightly after mount() returns; retry briefly.`
+
+这和现场 `ENOTCONN` 的观察是一致的：
+
+- mount syscall 返回
+- 不代表访问 repo deeper path 时一定稳定
+
+#### C. 当前 `ready=true` 更像“root inode ready”，不是“repo deep path ready”
+
+在 `scorpiofs/src/dicfuse/store.rs` 里：
+
+- `wait_for_ready()` 只是等一个布尔 ready 标记
+- 但 `mark_ready()` 是在 root inode 刚建好后就调用的
+- 后续 deeper directory entries 仍然是 lazy load / background warmup
+
+也就是说当前 ready 语义更接近：
+
+- 根目录可以挂上
+- store 基本初始化好了
+- 但深层目录树还在继续加载
+
+这对“快速 mount”是有利的，但对 Buck2 这种一上来就扫 repo root / cells / config / subdirs 的调用来说，仍然可能太早。
+
+#### D. Dicfuse import 也是后台启动的
+
+`scorpiofs/src/dicfuse/manager.rs` 会在后台 task 里启动 `import_arc()`。
+
+这进一步说明当前设计取向是：
+
+- 优先降低 mount latency
+- 接受后续 lazy load / background import
+
+所以从设计上讲，它本来就更容易出现“mount 返回了，但深路径还在 warming”的窗口。
+
+### 3) 因此，`ENOTCONN` 的更准确 root cause 是什么
+
+当前更准确的说法不是：
+
+- “Buck2 命令有问题”
+- “daemon 这个概念错了”
+- “Scorpiofs 整体不可用”
+
+而是：
+
+- **Scorpiofs 当前的 ready 语义，对 Buck2 target discovery 这种重路径遍历负载来说不够强**
+
+具体链路可以理解为：
+
+1. `mount_job()` 返回
+2. FUSE session 已经存在，root 级 ready 可能也已经被标记
+3. deeper repo path 仍在 lazy load / warming / background import
+4. Orion 立即执行 `buck2 audit cell / audit config / targets`
+5. Buck2 在错误时机访问 deeper path
+6. 内核返回 `Transport endpoint is not connected (os error 107)`
+
+所以这更像是：
+
+- **mount returned too early for heavy path traversal**
+
+### 4) Scorpiofs 现在需要先升级版本吗
+
+目前从上游仓库看到：
+
+- 可见 tag 只有 `v0.1.1`
+- HEAD 也就是 `v0.1.1` 对应附近提交，没有看到一个更高的新 release 能直接拿来验证
+
+所以当前不建议把希望放在：
+
+- “先升一个 Scorpiofs 新版本，这个问题自然消失”
+
+更现实的路径是：
+
+- 在现有 Scorpiofs 语义上补 readiness / mount 健康状态 / deep path probe
+
+### 5) 对 Orion 侧的启发
+
+这也解释了为什么 Orion 侧目前做的防守是合理的：
+
+- `wait_for_repo_mount_ready()`
+- target discovery retry
+- 把 `ENOTCONN` / `ESTALE` / `ENOENT` 当作短时瞬时错误处理
+
+这些不是“拍脑袋重试”，而是在补 Scorpiofs 当前 readiness contract 的空档。
+
+也就是说：
+
+- Orion 侧重试是必要防守
+- 但最终更理想的修法仍然要落回 Scorpiofs 侧
+
+### 6) 建议的 Scorpiofs 修复点（patch 方向）
+
+#### Patch 1: 拆分 `RootReady` 和 `DeepReady`
+
+当前 `ready=true` 信息量太少。建议拆成两个阶段：
+
+- `RootReady`: root inode 已建立，mount 可附着
+- `DeepReady`: 指定 repo subtree probe 成功，可承接 Buck2 这类 heavy traversal
+
+#### Patch 2: 在 ready 之前增加真实 repo path probe
+
+不要只在 root 级别判断 ready，应该在真正对外报告 `DeepReady` 前主动探测：
+
+- `metadata(repo_prefix)`
+- `read_dir(repo_prefix)`
+- 必要时探测 `.buckconfig` 或 Buck2 project root 关键路径
+
+并对这些错误做短时 retry：
+
+- `ENOTCONN`
+- `ESTALE`
+- `ENOENT`
+- 瞬时 `EIO`
+
+#### Patch 3: 显式跟踪 FUSE session 早退/异常退出
+
+如果后台 FUSE task 提前退出，不应该还让 mount 在控制面上维持“已挂载/ready”。
+
+建议 mount lifecycle 增加更细状态：
+
+- `Mounting`
+- `RootReady`
+- `DeepReady`
+- `Degraded` / `Failed`
+- `Unmounted`
+
+#### Patch 4: 为 Buck2/Orion 暴露“项目路径可访问”语义
+
+最理想的 contract 不是：
+
+- `mount_job()` 成功
+
+而是：
+
+- `wait_until_repo_accessible(project_root)`
+
+这样 Orion 就不需要自行猜测“什么时候可以跑 Buck2 cells”。
+
+#### Patch 5: 把 `path.db` 锁竞争和 `ENOTCONN` 分开修
+
+Scorpiofs 里 `path.db` / sled 锁竞争是另一层问题，不要和 `ENOTCONN` 修复混在一起验证。
+
+当前至少有两类问题要分层处理：
+
+- L1: mount readiness / FUSE availability (`ENOTCONN`, `ESTALE`)
+- L3: shared store DB lock contention (`path.db`, `WouldBlock`)
+
+### 7) 当前总论
+
+所以这层 `ENOTCONN` 的最终判断是：
+
+- 不是 Buck2 指令本身写错了
+- 不是 daemon 语义本身有问题
+- 主要是 Scorpiofs 当前“快速 mount 返回”的设计，与 Buck2“立即做深路径扫描”的使用方式之间存在 contract gap
+
+因此更合理的修复顺序是：
+
+1. Orion 继续保留 `wait_for_repo_mount_ready()` 和 retry 防守
+2. Scorpiofs 增强 path-level readiness / mount 健康状态语义
+3. 再单独处理 `path.db` 锁竞争与 store 生命周期问题
+
+
+---
+
+## Part 10: scorpiofs FUSE 层修复 (2026-03-09)
+
+### 1) 出发点
+
+从 orion 侧三层问题分析 (Part 9) 确认:
+- L1 (os error 107) 的 retry 机制在 orion 已到位
+- 但 ENOTCONN 的**根因**在 scorpiofs 侧: FUSE session 意外死亡后，错误被静默丢弃
+
+需要到 scorpiofs 仓库 (`https://github.com/jerry609/scorpiofs.git`) 排查并修复。
+
+### 2) 发现的问题
+
+#### 问题 A: FUSE session 错误被静默丢弃
+
+位置: `src/antares/fuse.rs:101-103`
+
+```rust
+// 修复前 — 静默丢弃所有 FUSE session 错误
+let fuse_task = tokio::spawn(async move {
+    let _ = handle.await;  // <-- 所有错误被 let _ 吞掉
+});
+```
+
+影响: 当 FUSE session 因任何原因死亡时:
+1. 没有任何日志记录死亡原因
+2. 挂载点变成 stale mount — 所有后续 I/O 返回 `ENOTCONN (os error 107)`
+3. 调用方 (orion) 完全看不到根因
+
+#### 问题 B: unmount() 代码重复
+
+位置: `src/antares/fuse.rs:143-200`
+
+`fusermount -uz` 的 fallback 逻辑在三个 match arm 中**完全相同**地复制了三次 (~30 行重复代码)。
+这增加了维护负担，也容易在修改时遗漏某个分支。
+
+#### 问题 C: server/mod.rs 死代码
+
+位置: `src/server/mod.rs:1-53`
+
+54 行完全注释掉的旧 `fuse_backend_rs` 实现，已被 `rfuse3` 替代。
+
+### 3) 修复内容
+
+分支: `fix/fuse-session-error-handling`
+提交: `3e9a294`
+
+| # | 文件 | 改动 | 描述 |
+|---|------|------|------|
+| A | src/antares/fuse.rs mount() | +12 -3 | `let _ = handle.await` → match + tracing::error 记录 session 死亡 |
+| B | src/antares/fuse.rs unmount() | +20 -62 | 3x fusermount -uz 重复 → `needs_lazy` boolean + 单次执行 |
+| C | src/server/mod.rs | +0 -54 | 删除注释掉的旧 fuse_backend_rs 实现 |
+
+总计: 2 files changed, 32 insertions(+), 97 deletions(-)
+
+#### Fix A 详情
+
+```rust
+// 修复后 — 记录 FUSE session 死亡原因
+let mp_display = self.mountpoint.display().to_string();
+let fuse_task = tokio::spawn(async move {
+    match handle.await {
+        Ok(()) => tracing::debug!("FUSE session ended normally for {}", mp_display),
+        Err(e) => tracing::error!(
+            "FUSE session died for {}: {} — clients will see ENOTCONN",
+            mp_display, e,
+        ),
+    }
+});
+```
+
+#### Fix B 详情
+
+```rust
+// 修复后 — needs_lazy 模式消除重复
+let needs_lazy = match graceful {
+    Ok(Ok(output)) if output.status.success() => false,
+    Ok(Ok(output)) => { tracing::warn!(...); true }
+    Ok(Err(e)) => { tracing::warn!(...); true }
+    Err(_) => { tracing::warn!(...); true }
+};
+
+if needs_lazy {
+    // 只执行一次 fusermount -uz
+    let lazy = tokio::process::Command::new("fusermount")
+        .arg("-uz").arg(&mount_path).output().await?;
+    ...
+}
+```
+
+### 4) 验证
+
+| 检查项 | 结果 |
+|--------|------|
+| cargo check | 通过，0 errors |
+| cargo clippy -- -W clippy::all | 通过，0 warnings |
+| cargo test (non-mount) | 55 passed, 15 ignored |
+| 3 个 daemon::tests 失败 | **pre-existing** — sled WouldBlock (L3 问题) |
+| 7 个 mount tests ignored | 需要 root FUSE 权限，跳过 |
+
+### 5) os error 107 完整修复链路
+
+现在从 scorpiofs 到 orion 的完整防御链:
+
+```
+[scorpiofs 层 — 本次修复]
+  FUSE session 死亡 → tracing::error 记录根因 (Fix A)
+  unmount 失败 → graceful → lazy 两级回退 (Fix B, 无重复)
+
+[orion 层 — Part 9 已确认]
+  mount 后 → wait_for_repo_mount_ready() 轮询 15s 确认可达
+  buck2.cells() → is_retryable_target_discovery_error() 识别 ENOTCONN
+  build() → MAX_TARGETS_ATTEMPTS=3, 每次 retry 重新 unmount+mount
+```
+
+### 6) 更新后的问题总表
+
+| # | 问题 | 层 | 状态 | 备注 |
+|---|------|-----|------|------|
+| 1 | 挂载返回后 FUSE 未 ready (ENOTCONN/ESTALE) | L1 | 已修复 | wait_for_repo_mount_ready + 3次 retry |
+| 2 | 跳过 unmount 导致脏挂载积累 | L1 | 已修复 | 恢复 unmount + MountGuard RAII |
+| 3 | build 早返回路径未统一回收 | L1 | 已修复 | 统一 cleanup 路径 |
+| 4 | ignored test 用同步阻塞命令 | - | 已修复 | 改为 tokio async |
+| 5 | Buck2 daemon state 落在 FUSE buck-out | L2 | 已修复 | host-local buck-out 隔离 |
+| 6 | --event-log 参数位置错误 | L2 | 已修复 | 提取 helper + 测试 |
+| 7 | 死代码 (PROJECT_ROOT, util.rs) | - | 已修复 | Part 9 删除 34 行 |
+| 8 | FUSE session 错误被静默丢弃 | L1 | **已修复** | 本次 scorpiofs Fix A |
+| 9 | unmount() 代码重复 3x | - | **已修复** | 本次 scorpiofs Fix B |
+| 10 | server/mod.rs 死代码 | - | **已修复** | 本次 scorpiofs Fix C |
+| 11 | worker 异常退出后 buck-out 残留 | L2 | 部分修复 | 正常路径已清理; 异常路径建议补 GC |
+| 12 | Orphan buck2 daemons 在 FUSE 不可用时无法清理 | L2 | 已知 | 建议记录 PID 做 fallback kill |
+| 13 | Scorpio path.db WouldBlock 锁竞争 | L3 | 已知 | scorpiofs 层 sled 独占锁问题 |
+| 14 | Zombie scorpio 进程 | L3 | 已知 | PPID=1, 等 init reap |
+| 15 | e2e 测试 teardown 不完整 | L3 | 已知 | 需要 scorpiofs 侧改进 |
+| 16 | state.toml 与实际挂载不同步 | L3 | 已知 | 需要 antares manager 侧改进 |
