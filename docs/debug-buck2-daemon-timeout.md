@@ -3863,3 +3863,97 @@ if needs_lazy {
    - 现在通过双写 helper + read fallback 把边界补齐。
 
 所以这轮修改的目标不是“再多挡几个报错字符串”，而是把语义真正放回各自该在的层里。
+
+### F. 2026-03-10 推送后回归（基于远端仓库分支）
+
+本轮不是继续吃本地 path dependency，而是先把代码推到远端仓库，再用推送后的代码重新编译和回归：
+
+- `scorpiofs` 分支：`fix/enotconn-fuse-session-liveness`
+  - 推送提交：`d8e4206`
+- `mega` 分支：`fix/buck2-daemon-timeout-v2`
+  - 推送提交：`5571f26f`
+
+同时将 `orion/Cargo.toml` 里的 `scorpiofs` 依赖从本地路径改成了远端 git 分支依赖：
+
+- `https://github.com/jerry609/scorpiofs.git`
+- `branch = "fix/enotconn-fuse-session-liveness"`
+
+这样验证结果不再依赖宿主机上的 `/root/jerry/scorpiofs` 本地路径，分支本身即可复现当前集成状态。
+
+#### F.1 推送后静态验证
+
+- `/root/jerry/scorpiofs`
+  - `cargo test wait_for_path_ready --lib -- --nocapture` 通过
+- `/root/jerry/mega`
+  - `cargo test -p orion-server test_build_state_from_build_record_detects_pending_queue_state -- --nocapture` 通过
+  - `cargo test -p orion-server test_build_event_state_from_fields -- --nocapture` 通过
+  - `cargo test -p orion test_retryable_build_setup_error_detects_fuse_disconnects -- --nocapture` 通过
+  - `cargo build --release -p orion -p orion-server` 通过
+
+#### F.2 推送后真实链路回归
+
+##### Case 1：同 `build_id` 并发 5 次
+
+- `build_id = 7d327c17-2e54-4e74-a60e-c959a1f7613b`
+- `task_id = 019cd368-6955-7f03-9d97-3992ef8d0b6d`
+
+结果：
+
+- 1 次 `dispatched`
+- 4 次 `building`
+- 最终：
+  - `/v2/build-state/{build_id}` => `"Skipped"`
+  - `/v2/latest_build_result/{task_id}` => `"Skipped"`
+  - `builds` 中 1 行
+  - `build_events` 中 1 行
+
+##### Case 2：`/retry-build`
+
+基于上面的同一 `build_id`：
+
+- `/retry-build` 返回 `Build retry dispatched immediately to worker`
+- 最终：
+  - `/v2/build-state/{build_id}` => `"Skipped"`
+  - `/v2/latest_build_result/{task_id}` => `"Skipped"`
+  - `builds.retry_count = 1`
+  - `build_events.retry_count = 1`
+
+##### Case 3：worker 不在场 -> 任务入队 -> 拉起 worker
+
+- `build_id = 8bdd7eab-01a4-4802-b1a1-4ae64382aa64`
+- `task_id = 019cd36c-8825-7b70-8aff-d40e5d4b01a5`
+
+结果：
+
+- 创建任务后立即：`/v2/build-state/{build_id}` => `"Pending"`
+- 拉起 worker 后最终：
+  - `/v2/build-state/{build_id}` => `"Skipped"`
+  - `/v2/latest_build_result/{task_id}` => `"Skipped"`
+  - `builds` 中 1 行
+  - `build_events` 中 1 行
+
+#### F.3 针对本次核心问题的结论
+
+针对：
+
+- `Error getting build targets: Fail to get cells: Transport endpoint is not connected (os error 107)`
+
+本轮“推送后重新编译 + 真实链路回归”的新增日志中：
+
+- `Transport endpoint is not connected`
+- `os error 107`
+- `Timed out waiting for mounted repo path`
+
+**新增匹配数均为 0**。
+
+同时这轮新增日志中的：
+
+- `rfuse3::raw::session: The data is not 4096 bytes aligned`
+
+**新增匹配数也为 0**。
+
+也就是说，至少在这三条真实回归链路里：
+
+- 之前 target discovery 阶段的 `os error 107` 没有再出现；
+- 没有引入新的 mount-ready 回归；
+- 没有重新刷出那条 4096 对齐 warning。
