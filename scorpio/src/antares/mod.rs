@@ -17,6 +17,8 @@ use crate::{
     util::config,
 };
 
+use fuse::AntaresFuse;
+
 /// Global paths used by Antares to place layers and state.
 #[derive(Debug, Clone)]
 pub struct AntaresPaths {
@@ -73,12 +75,11 @@ struct AntaresState {
 }
 
 /// Manager responsible for creating and tracking Antares overlay instances.
-/// This scaffold currently wires directory creation and bookkeeping; the unionfs
-/// integration will be added once the layer stack is finalized.
 pub struct AntaresManager {
     dic: Arc<Dicfuse>,
     paths: AntaresPaths,
     instances: Arc<Mutex<HashMap<String, AntaresConfig>>>,
+    fuse_handles: Arc<Mutex<HashMap<String, AntaresFuse>>>,
 }
 
 impl AntaresManager {
@@ -90,10 +91,11 @@ impl AntaresManager {
             dic,
             paths,
             instances: Arc::new(Mutex::new(instances)),
+            fuse_handles: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    /// Create directories and register a job instance. UnionFS wiring is added later.
+    /// Create directories, mount the FUSE overlay, and register a job instance.
     pub async fn mount_job(
         &self,
         job_id: &str,
@@ -140,6 +142,47 @@ impl AntaresManager {
 
         self.persist_state().await?;
 
+        // Create and mount the FUSE overlay filesystem
+        let mut fuse = AntaresFuse::new(
+            instance.mountpoint.clone(),
+            self.dic.clone(),
+            instance.upper_dir.clone(),
+            instance.cl_dir.clone(),
+        )
+        .await?;
+
+        fuse.mount().await?;
+
+        // Post-mount probe: verify FUSE session is actually responding
+        match tokio::fs::metadata(&instance.mountpoint).await {
+            Ok(_) => {}
+            Err(e) => {
+                fuse.unmount().await.ok();
+                let _ = std::fs::remove_dir_all(&instance.mountpoint);
+                let _ = std::fs::remove_dir_all(&instance.upper_dir);
+                if let Some(cl) = &instance.cl_dir {
+                    let _ = std::fs::remove_dir_all(cl);
+                }
+                // Remove bookkeeping since mount failed
+                self.instances.lock().await.remove(job_id);
+                self.persist_state().await.ok();
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!(
+                        "mount probe failed on {}: {}",
+                        instance.mountpoint.display(),
+                        e
+                    ),
+                ));
+            }
+        }
+
+        // Store live FUSE handle
+        self.fuse_handles
+            .lock()
+            .await
+            .insert(job_id.to_string(), fuse);
+
         tracing::info!(
             "antares: mount_job done job_id={} mountpoint={} elapsed={:.2}s",
             job_id,
@@ -168,31 +211,37 @@ impl AntaresManager {
         let mount_path = &config.mountpoint;
         info!("Attempting to unmount FUSE mount at {:?}", mount_path);
 
-        let output = tokio::process::Command::new("fusermount")
-            .arg("-u")
-            .arg(mount_path)
-            .output()
-            .await?;
-
-        if !output.status.success() {
-            let error_msg = String::from_utf8_lossy(&output.stderr);
-            // Check if the error is because the filesystem is not mounted
-            // In this case, we still proceed to remove bookkeeping
-            if error_msg.contains("not mounted") || error_msg.contains("Invalid argument") {
-                warn!(
-                    "Filesystem at {:?} is not mounted, removing bookkeeping only: {}",
-                    mount_path, error_msg
-                );
+        // Use AntaresFuse::unmount() if we have a live handle
+        if let Some(mut fuse) = self.fuse_handles.lock().await.remove(job_id) {
+            if let Err(e) = fuse.unmount().await {
+                warn!("AntaresFuse::unmount() failed for {}: {}", job_id, e);
             } else {
-                warn!(
-                    "fusermount -u failed with status {} for {:?}: {}",
-                    output.status, mount_path, error_msg
-                );
-                // For other errors, we still remove bookkeeping to avoid stale entries
-                // but log the warning
+                info!("Successfully unmounted {:?} via AntaresFuse", mount_path);
             }
         } else {
-            info!("Successfully unmounted {:?}", mount_path);
+            // Fallback: raw fusermount -u for mounts created before this fix
+            let output = tokio::process::Command::new("fusermount")
+                .arg("-u")
+                .arg(mount_path)
+                .output()
+                .await?;
+
+            if !output.status.success() {
+                let error_msg = String::from_utf8_lossy(&output.stderr);
+                if error_msg.contains("not mounted") || error_msg.contains("Invalid argument") {
+                    warn!(
+                        "Filesystem at {:?} is not mounted, removing bookkeeping only: {}",
+                        mount_path, error_msg
+                    );
+                } else {
+                    warn!(
+                        "fusermount -u failed with status {} for {:?}: {}",
+                        output.status, mount_path, error_msg
+                    );
+                }
+            } else {
+                info!("Successfully unmounted {:?} via fusermount fallback", mount_path);
+            }
         }
 
         // Remove from bookkeeping and persist (even if unmount failed)
@@ -211,6 +260,15 @@ impl AntaresManager {
     /// Access the underlying Dicfuse instance (read-only tree layer).
     pub fn dicfuse(&self) -> Arc<Dicfuse> {
         self.dic.clone()
+    }
+
+    /// Check whether the FUSE session for a given job is still alive.
+    pub async fn is_job_alive(&self, job_id: &str) -> bool {
+        self.fuse_handles
+            .lock()
+            .await
+            .get(job_id)
+            .map_or(false, |f| f.is_session_alive())
     }
 
     fn load_state(path: &Path) -> std::io::Result<HashMap<String, AntaresConfig>> {

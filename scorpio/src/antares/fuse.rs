@@ -112,6 +112,13 @@ impl AntaresFuse {
         Ok(())
     }
 
+    /// Check whether the background FUSE task is still running.
+    pub fn is_session_alive(&self) -> bool {
+        self.fuse_task
+            .as_ref()
+            .map_or(false, |t| !t.is_finished())
+    }
+
     /// Unmount the FUSE session if mounted.
     ///
     /// Uses lazy unmount (`fusermount -uz`) to detach the filesystem even if
