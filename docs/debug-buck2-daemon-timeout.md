@@ -2521,3 +2521,213 @@ ignored 环境测试也同步扩展成分阶段验证，按顺序执行：
 - 观测挂载后首次 `lookup/open/read` 的耗时与失败率
 - 区分 `source tree 读取问题` 与 `buck-out 写状态问题`
 - 若后续仍出现 daemon 级异常，可继续评估更强的隔离目录策略，或在极端场景下进一步限制 daemon 复用
+
+
+## 二十一、2026-03-09 本地 buck-out 隔离的设计含义与影响面
+
+### 1) 这到底是什么意思
+
+本轮修复里说的：
+
+- 把挂载 repo 里的 `buck-out` 改成指向宿主机本地目录 `/tmp/orion-buck-out/buck-out-<hash>` 的 symlink
+
+意思不是“把整个 repo 挪到本地”或者“绕开 Antares/FUSE 读源码”，而是只调整 **Buck2 的可写状态目录**。
+
+实际效果可以理解成：
+
+- 代码、BUCK、PACKAGE、.buckconfig 等源码树：仍然从 FUSE 挂载 repo 读取
+- `buck-out` 这个构建输出/状态目录：从挂载层切换到宿主机本地普通文件系统
+
+也就是 mounted repo 里表面上仍然有一个 `buck-out` 路径，但它不再直接写进 FUSE upper layer，而是一个软链：
+
+```text
+<mounted repo>/buck-out -> /tmp/orion-buck-out/buck-out-<hash>
+```
+
+Buck2 仍然从 repo 根目录工作，只是当它访问 `buck-out/...` 时，内核会把这部分访问转发到宿主机本地目录。
+
+### 2) 这有没有改变原本模块设计的出发点
+
+严格来说，这不是推翻原本设计，而是把原本设计里“源码视图”和“构建临时状态”这两个概念分得更清楚。
+
+原本模块设计的核心出发点是：
+
+- Orion 在一个挂载出来的 repo 视图上做 target discovery 和 build
+- 源码读取、差异对比、配置解析，都针对这份挂载出来的工作视图进行
+- worker 不直接修改真正的上游仓库，而是在隔离环境里执行构建
+
+这几个出发点并没有变。
+
+真正变化的是：
+
+- 以前默认认为 `buck-out` 也可以跟源码树一起留在挂载视图里
+- 现在确认这一点在 FUSE/scorpiofs overlay upper layer 上不成立，因为 Buck2 的 daemon/materializer/incremental state 需要可靠的 advisory lock
+
+所以这次修改更像是：
+
+- 保留“源码视图走挂载”的原设计
+- 纠正“Buck2 可写状态也应该落在挂载层”的实现假设
+
+换句话说，**这次不是改变模块边界，而是修正模块边界上的介质选择**。
+
+### 3) 为什么不先粗暴规避 daemon
+
+表面上看，最简单的办法像是“不要 Buck2 daemon 了”。但这不是更好的第一选择，原因有三类：
+
+#### A. 问题本质不是 daemon 这个概念本身，而是 daemon state 落在错误的文件系统层
+
+这次现场报错：
+
+```text
+Error initializing DaemonStateData
+Error code 3850: I/O error in the advisory file locking layer
+```
+
+已经非常指向“状态目录/锁文件所在文件系统不适合做 advisory lock”。
+
+如果只是一刀切规避 daemon：
+
+- 可能暂时绕开一部分复用路径
+- 但没有解决“Buck2 需要一个稳定可写的状态目录”这个根问题
+
+#### B. 粗暴禁用 daemon 会把性能和稳定性问题混在一起
+
+Buck2 daemon 本来就承载了：
+
+- 配置/解析复用
+- materializer / incremental state
+- 降低多次命令启动成本
+
+如果直接规避 daemon，短期可能让错误消失，但代价是：
+
+- target discovery 和 build 性能一起退化
+- 后续很难分辨到底是“锁问题修好了”，还是“只是把路径全绕开了”
+
+#### C. 本地 buck-out 隔离是更小、更聚焦的修复
+
+本轮方案只改变一个关键事实：
+
+- `buck-out` 落点从 FUSE upper layer 改到 host-local FS
+
+而没有改变：
+
+- repo mount 方式
+- target discovery 入口
+- build 执行模型
+- Buck2 的命令语义
+
+这比“全面规避 daemon”更容易验证，也更符合最小改动原则。
+
+### 4) 改成指向本地会带来什么影响
+
+#### A. 正向影响
+
+1. **锁语义更稳定**
+   - Buck2 的 SQLite/materializer/incremental state 不再依赖 FUSE upper layer
+   - `Error code 3850` 这一类 advisory lock I/O error 明显下降
+
+2. **减少对 FUSE 写路径的压力**
+   - 源码读取仍然通过挂载
+   - 但频繁变化的 build state 不再写回 overlay upper
+   - 能降低 FUSE 在 mkdir/open/lock/rename 这一侧的复杂度
+
+3. **不牺牲 Buck2 的正常工作模型**
+   - 仍然保留 daemon / isolation dir / target discovery / build 的原有用法
+   - 修复更聚焦，回归面更可控
+
+#### B. 需要接受的副作用
+
+1. **`buck-out` 的物理位置变了**
+   - 从“挂载 repo 的 upper layer 目录”变成“宿主机 `/tmp/orion-buck-out/...`”
+   - 所以以后排查 build state 时，不应该只去翻 FUSE upper layer
+
+2. **会增加宿主机本地磁盘占用**
+   - 构建产物和 Buck2 状态写到 `/tmp/orion-buck-out`
+   - 如果 worker 异常退出，可能残留孤儿目录，需要后续考虑 GC/启动清理
+
+3. **调试视角会变化**
+   - 以前看“挂载层里写了什么”就能看到 `buck-out`
+   - 现在看 repo 内部路径仍然能看到 `buck-out`，但它背后其实是 symlink 到 host-local
+   - 这要求调试文档、脚本、值班排查口径一起更新
+
+### 5) 对其他模块的影响是什么
+
+#### A. 基本不受影响的模块
+
+以下模块的设计前提没有变化：
+
+- repo diff / changes 分析
+- target discovery
+- BUCK / PACKAGE / .buckconfig 读取
+- 挂载生命周期管理
+- build 请求幂等与排队控制逻辑
+
+原因是这些逻辑依赖的都是：
+
+- repo 根目录是否可访问
+- 源码树内容是否一致
+- Buck2 命令是否能在 project root 正常执行
+
+而不是依赖 `buck-out` 一定要写在 FUSE upper layer。
+
+#### B. 可能需要注意的模块/脚本
+
+1. **直接观察 overlay upper layer 的调试脚本**
+   - 如果脚本假设 `buck-out` 一定出现在 `/tmp/megadir/antares/upper/...` 下，结论会失真
+   - 这类脚本要同步兼容 `/tmp/orion-buck-out/...`
+
+2. **清理逻辑**
+   - 现在不仅要 unmount，还要清理：
+     - mounted repo 内的 `buck-out` symlink
+     - `/tmp/orion-buck-out/...` 对应目录
+   - 否则会留下本地状态目录残留
+
+3. **打包/归档脚本**
+   - 如果某些工具递归打包 repo 目录时对 symlink 处理特殊，可能需要确认是否 follow symlink
+   - 不过从 Buck2 正常运行角度看，`repo/buck-out/...` 这个路径本身仍然成立
+
+#### C. 没有引入的新耦合
+
+这次没有把其他模块绑死到 `/tmp/orion-buck-out` 上：
+
+- 其他模块只要通过 repo 内的 `buck-out` 路径访问，symlink 对它们通常是透明的
+- 新增耦合主要发生在清理逻辑和运维排障视角，而不是业务语义层面
+
+### 6) 当前问题总表与状态
+
+截至 2026-03-09，这条链路里已经明确过的问题可以归纳为：
+
+1. **挂载刚返回时 repo 目录未完全 ready，触发 `ENOTCONN` / `ESTALE` / `ENOENT`**
+   - 状态：已加 `wait_for_repo_mount_ready()` 和 target discovery retry 防守
+
+2. **调试期跳过 unmount，导致脏挂载积累、旧 session 无法及时回收**
+   - 状态：已恢复正常 unmount 和 build 结束清理
+
+3. **build 早返回路径没有统一回收 target build tracker / buck2 daemon**
+   - 状态：已统一 cleanup 路径
+
+4. **真实环境 ignored test 使用同步阻塞命令，误造成“像 host/FUSE 挂死”的假象**
+   - 状态：已改为多线程 tokio runtime + `tokio::process::Command`
+
+5. **Buck2 daemon/materializer state 落在 FUSE `buck-out`，触发 advisory lock I/O error 3850**
+   - 状态：已通过 host-local `buck-out` 隔离修复
+
+6. **worker 异常退出后，本地 `buck-out` 目录可能残留**
+   - 状态：已在正常路径清理；异常路径的 GC 仍建议补充
+
+7. **“宿主机/FUSE/scorpiofs 更底层偶发卡住”是否仍存在**
+   - 状态：本轮没有稳定复现；仍是待继续观察的剩余风险
+
+### 7) 当前结论
+
+所以，“本地 buck-out 隔离”这件事本质上不是把系统改成了“本地构建，不走挂载”，也不是把模块设计推翻重来。
+
+更准确地说，它是在保持以下前提不变：
+
+- 源码视图仍然来自挂载 repo
+- Buck2 仍在 mounted repo/project root 上执行
+- Orion 的调度、幂等、排队、回收逻辑不变
+
+的情况下，把 **原本不适合放在 FUSE upper layer 的高频可写状态** 移到 host-local 文件系统。
+
+这是一次偏实现层、介质层的修正，而不是业务架构层的翻转。
