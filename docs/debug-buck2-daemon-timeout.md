@@ -2731,3 +2731,257 @@ Buck2 daemon 本来就承载了：
 的情况下，把 **原本不适合放在 FUSE upper layer 的高频可写状态** 移到 host-local 文件系统。
 
 这是一次偏实现层、介质层的修正，而不是业务架构层的翻转。
+
+
+---
+
+## Part 8: 远程服务器测试与检查 (2026-03-09)
+
+### 1) 测试环境
+
+- 服务器: 47.79.95.33
+- 项目路径: /root/jerry/mega
+- 分支: fix/buck2-daemon-timeout-v2
+- 最新提交(检查前): b6bc0cea docs: explain local buck-out isolation tradeoffs
+- OS: Linux (Debian/Ubuntu), 16GB RAM, 232G disk
+
+### 2) 编译与测试结果
+
+#### A. 编译检查
+
+```
+cargo check -p orion
+结果: 编译通过，无错误
+```
+
+#### B. 单元测试
+
+```
+cargo test -p orion -- --nocapture
+结果: 39 passed, 0 failed, 1 ignored (共两个 test binary, 每个 39 pass)
+被 ignore 的测试: test_real_mount_waits_until_buck2_cells_succeeds
+  (需要 buck2, /dev/fuse, 网络, SCORPIO_CONFIG 环境)
+```
+
+所有非 ignored 测试全部通过:
+
+| 测试 | 结果 |
+|------|------|
+| test_ensure_local_buck_out_creates_symlink | PASS |
+| test_buck2_build_arguments_place_event_log_after_build_subcommand | PASS |
+| test_retryable_target_discovery_error_detects_fuse_disconnects | PASS |
+| test_mount_guard_creation | PASS |
+| test_wait_for_repo_mount_ready_retries_until_dir_exists | PASS |
+| test_wait_for_repo_mount_ready_times_out_for_missing_dir | PASS |
+| duplicate_build_id_is_rejected_while_guard_is_alive | PASS |
+| 32 个 repo::changes / repo::diff 测试 | ALL PASS |
+
+#### C. Clippy 检查
+
+初始检查发现 1 个 warning:
+
+```
+warning: this if statement can be collapsed
+   --> orion/src/buck_controller.rs:389:5
+    (clippy::collapsible_if)
+```
+
+位于 cleanup_local_buck_out 函数中，嵌套的 if let 可以合并。已修复。
+
+修复后 clippy 清零:
+```
+cargo clippy -p orion -- -W clippy::all
+结果: 0 warnings
+```
+
+### 3) 发现的环境问题与清理
+
+#### A. 问题清单
+
+| # | 严重度 | 问题 | 清理前状态 | 清理后状态 |
+|---|--------|------|------------|------------|
+| 1 | P0 | 5个 orphan buck2 daemon 进程 | 5个 buck2d + 5个 forkserver, 约1GB RSS | 0个 |
+| 2 | P1 | 148个历史 buck2-isolation 目录 | /root/jerry/mega/buck-out/ 下，全部来自 Feb 26 | 已清理(剩余5个活跃目录) |
+| 3 | P1 | 18个 stale antares e2e FUSE 挂载 | fusermount 列出 18 个未卸载 | 全部 fusermount -uz 卸载 |
+| 4 | P1 | 8个 codex-mount-ready 测试挂载点残留 | /tmp/megadir/antares/mnt/ 下 | 已删除 |
+| 5 | P1 | 6个 stale antares build directories | /tmp/megadir/antares/mnt/ 下, 占位 UUID | 已删除 |
+| 6 | P2 | 磁盘使用率 91% (22G free / 232G) | 210G used | 清理后 210G (isolation dirs 本身不大) |
+
+#### B. Orphan buck2 daemon 详情
+
+发现 5 个 buck2 daemon 进程(启动于 Mar 8，从未被回收):
+
+1. buck2d[mega] --isolation-dir codex-sanity (PID 2411513)
+   - forkserver state-dir: /root/jerry/mega/buck-out/codex-sanity/forkserver
+   - 这个在项目根目录，不在 FUSE 上
+
+2-5. buck2d[codex-mount-ready-*] --isolation-dir codex-mount-ready-test (PIDs 2414981, 2415103, 2416212, 2416333)
+   - forkserver state-dir: /tmp/megadir/antares/mnt/codex-mount-ready-UUID/buck-out/codex-mount-ready-test/forkserver
+   - 关键发现: 这些 forkserver 的 state-dir 指向 FUSE 挂载路径，而不是 /tmp/orion-buck-out/
+   - 原因: 这些 daemon 是由 test_real_mount_waits_until_buck2_cells_succeeds 测试启动的
+   - 虽然测试调用了 ensure_local_buck_out() 创建 symlink，但测试用的硬编码 isolation_dir "codex-mount-ready-test" 不同于生产代码的 buck2_isolation_dir() 生成值
+   - daemon 被 cleanup，但因为 FUSE mount 目录已空(.buckconfig 不存在)，buck2 kill 无法通过正常方式清理
+   - 最终通过 kill PID 强制清理
+
+这暴露的根因:
+- 当 FUSE 挂载点的内容被清空/卸载后，之前在该挂载上启动的 buck2 daemon 变成"孤儿"
+- buck2 kill 需要在有效的 buck2 project root 下执行，如果挂载已不可用则无法工作
+- cleanup_buck2_daemon() 的"best-effort"语义在这种场景下就完全失效了
+
+建议改进: 在正常清理路径中，应先 buck2 kill 再 unmount。如果 kill 失败，记录 PID 并在后续尝试 kill -TERM PID。
+
+#### C. Stale FUSE mounts 详情
+
+18 个 antares_e2e_* 挂载，全部是之前的 e2e 测试留下的:
+- 8 个 antares_e2e_concurrent_* (每个 2 个 mount: mnt1, mnt2)
+- 2 个 antares_e2e_ro_* (每个 1 个 mount)
+
+这说明 e2e 测试的 teardown 没有可靠执行。
+
+### 4) 发现的代码问题与修复
+
+#### A. --event-log 参数位置 Bug
+
+问题: 原代码把 --event-log 放在 build 子命令之前:
+```rust
+cmd.args([
+    "--isolation-dir", &isolation_dir,
+    "--event-log", EVENT_LOG_FILE,  // 错误: 这是子命令参数
+]);
+let cmd = cmd.arg("build") // build 在 --event-log 之后
+```
+
+--event-log 是 buck2 build 的子命令参数，必须出现在 build 之后。
+
+修复: 提取 buck2_build_arguments() 辅助函数，确保参数顺序:
+```rust
+fn buck2_build_arguments(isolation_dir: &str, targets: &[TargetLabel]) -> Vec<String> {
+    let mut args = vec![
+        "--isolation-dir".to_string(), isolation_dir.to_string(),  // 全局参数
+        "build".to_string(),                                       // 子命令
+        "--event-log".to_string(), EVENT_LOG_FILE.to_string(),    // 子命令参数 (在 build 之后)
+        "--target-platforms".to_string(), "prelude//platforms:default".to_string(),
+        "--skip-incompatible-targets".to_string(),
+        "--verbose=2".to_string(),
+    ];
+    args.extend(targets.iter().map(|target| target.to_string()));
+    args
+}
+```
+
+新增测试: test_buck2_build_arguments_place_event_log_after_build_subcommand
+- 验证 --isolation-dir 在最前面
+- 验证 build 在 --event-log 之前
+- 验证 targets 在 --event-log 之后
+
+#### B. Clippy collapsible_if 警告修复
+
+问题: cleanup_local_buck_out 中嵌套的 if let:
+```rust
+if let Ok(metadata) = ... && metadata.file_type().is_symlink() {
+    if let Err(err) = std::fs::remove_file(...) {
+        tracing::debug!(...);
+    }
+}
+```
+
+修复: 合并为单个 if let chain:
+```rust
+if let Ok(metadata) = ... && metadata.file_type().is_symlink()
+    && let Err(err) = std::fs::remove_file(...)
+{
+    tracing::debug!(...);
+}
+```
+
+#### C. 提交记录
+
+```
+5d4bfaeb fix(orion): correct --event-log flag placement and clippy warning
+```
+
+### 5) 代码审查发现
+
+#### A. 代码结构分析
+
+buck_controller.rs 共约 1400 行，核心逻辑包括:
+
+| 功能区域 | 行范围 | 状态 |
+|----------|--------|------|
+| 常量与配置加载 | L1-243 | 正常 |
+| buck2_isolation_dir | L245-289 | 正常 - SHA256 hash 生成稳定的 isolation dir 名 |
+| cleanup_buck2_daemon | L291-331 | 注意 - best-effort, FUSE 不可用时失效 |
+| local_buck_out (symlink 管理) | L333-412 | 正常 - 创建/清理 symlink 逻辑完整 |
+| buck2_build_arguments | L414-428 | 新增 - 参数顺序正确 |
+| mount readiness probe | L430-585 | 正常 - 有 timeout + retry |
+| target discovery (get_repo_targets) | L587-631 | 正常 - 有 2 次重试 |
+| build status tracker (WS) | L680-849 | 正常 |
+| MountGuard (RAII) | L851-898 | 正常 - Drop 时 spawn unmount |
+| build() 主函数 | L919-1143 | 正常 - cleanup 路径已统一 |
+| tests | L1145-1400 | 覆盖核心路径 |
+
+#### B. 潜在改进点
+
+1. cleanup_buck2_daemon 的健壮性
+   - 当前: best-effort, 依赖 buck2 kill 在有效 project root 下执行
+   - 问题: FUSE mount 被卸载后，daemon 变孤儿，buck2 kill 无法工作
+   - 建议: 在 kill daemon 时记录 PID，如果 buck2 kill 失败，直接 kill -TERM PID
+
+2. build() 中的清理顺序
+   - 当前(正确): cleanup_buck2_daemon -> cleanup_local_buck_out -> unmount
+   - 这确保在 unmount 之前 daemon 已停止
+
+3. /tmp/orion-buck-out 的 GC 机制
+   - 当前: 只在正常 build 完成时清理
+   - 缺失: 启动时扫描并清理孤儿目录的逻辑
+   - 建议: 在 orion 启动时加一个 cleanup_stale_local_buck_out() 扫描
+
+### 6) 清理后最终状态
+
+```
+=== FUSE mounts ===
+1 个活跃 (scorpio-megadir, 正常)
+
+=== buck2 daemons ===
+0 个
+
+=== /tmp/orion-buck-out ===
+空目录 (正常)
+
+=== /root/jerry/mega/buck-out ===
+5 个目录:
+  buck2-isolation-f1fc2e73842fba13  (最近活跃)
+  buck2-subproj
+  codex-sanity
+  sanity-iso
+  v2
+
+=== antares mnt ===
+空 (已清理)
+```
+
+### 7) 更新后的问题总表
+
+截至 2026-03-09 测试检查后，问题总表更新为:
+
+| # | 问题 | 状态 | 备注 |
+|---|------|------|------|
+| 1 | 挂载刚返回时 repo 目录未完全 ready | 已修复 | wait_for_repo_mount_ready + retry |
+| 2 | 跳过 unmount 导致脏挂载积累 | 已修复 | 恢复正常 unmount 和清理 |
+| 3 | build 早返回路径没有统一回收 | 已修复 | 统一 cleanup 路径 |
+| 4 | ignored test 使用同步阻塞命令 | 已修复 | 改为 tokio async |
+| 5 | Buck2 daemon state 落在 FUSE buck-out | 已修复 | host-local buck-out 隔离 |
+| 6 | worker 异常退出后 buck-out 残留 | 部分修复 | 正常路径已清理; 建议补启动时 GC |
+| 7 | 宿主机/FUSE 偶发卡住 | 观察中 | 本轮未复现 |
+| 8 | --event-log 参数位置错误 | 已修复 | 提取 helper, 增加测试 (本次) |
+| 9 | Clippy collapsible_if 警告 | 已修复 | 合并嵌套 if let (本次) |
+| 10 | Orphan buck2 daemons 无法被 buck2 kill 清理 | 已手动清理 | 建议 cleanup 记录 PID 做 fallback kill |
+| 11 | e2e 测试 teardown 不完整(FUSE 残留) | 已手动清理 | e2e 测试需改进 teardown 逻辑 |
+| 12 | /tmp/orion-buck-out 启动时无 GC | 待做 | 建议在 orion 启动时扫描清理孤儿 |
+
+### 8) 本次新增提交
+
+```
+b6bc0cea docs: explain local buck-out isolation tradeoffs  (之前)
+5d4bfaeb fix(orion): correct --event-log flag placement and clippy warning  (本次)
+```
