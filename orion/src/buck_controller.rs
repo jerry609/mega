@@ -388,15 +388,14 @@ fn cleanup_local_buck_out(repo_path: &Path) {
     let mounted_buck_out = repo_path.join("buck-out");
     if let Ok(metadata) = std::fs::symlink_metadata(&mounted_buck_out)
         && metadata.file_type().is_symlink()
+        && let Err(err) = std::fs::remove_file(&mounted_buck_out)
     {
-        if let Err(err) = std::fs::remove_file(&mounted_buck_out) {
-            tracing::debug!(
-                repo = ?repo_path,
-                path = ?mounted_buck_out,
-                error = %err,
-                "Failed to remove mounted buck-out symlink"
-            );
-        }
+        tracing::debug!(
+            repo = ?repo_path,
+            path = ?mounted_buck_out,
+            error = %err,
+            "Failed to remove mounted buck-out symlink"
+        );
     }
 
     if let Err(err) = std::fs::remove_dir_all(&local_buck_out)
@@ -409,6 +408,22 @@ fn cleanup_local_buck_out(repo_path: &Path) {
             "Failed to remove local buck-out directory"
         );
     }
+}
+
+fn buck2_build_arguments(isolation_dir: &str, targets: &[TargetLabel]) -> Vec<String> {
+    let mut args = vec![
+        "--isolation-dir".to_string(),
+        isolation_dir.to_string(),
+        "build".to_string(),
+        "--event-log".to_string(),
+        EVENT_LOG_FILE.to_string(),
+        "--target-platforms".to_string(),
+        "prelude//platforms:default".to_string(),
+        "--skip-incompatible-targets".to_string(),
+        "--verbose=2".to_string(),
+    ];
+    args.extend(targets.iter().map(|target| target.to_string()));
+    args
 }
 
 fn is_retryable_mount_io_error(err: &io::Error) -> bool {
@@ -1036,21 +1051,10 @@ pub async fn build(
         let project_root = PathBuf::from(&mount_point).join(repo_prefix);
         let isolation_dir = buck2_isolation_dir(&project_root)?;
         let mut cmd = Command::new("buck2");
-        // --event-log and --build-report are used to collect build execution status
-        // at target level (e.g. pending / running / succeeded / failed).
-        cmd.args([
-            "--isolation-dir", &isolation_dir,
-            "--event-log", EVENT_LOG_FILE,
-        ]);
+        // `--event-log` is a `buck2 build` subcommand flag, so it must appear
+        // after `build` instead of before the subcommand.
         let cmd = cmd
-            .arg("build")
-            .args(&targets)
-            .arg("--target-platforms")
-            .arg("prelude//platforms:default")
-            // Avoid failing the whole build when a target is explicitly incompatible
-            // with the selected platform (e.g., macOS-only crates on Linux builders).
-            .arg("--skip-incompatible-targets")
-            .arg("--verbose=2")
+            .args(buck2_build_arguments(&isolation_dir, &targets))
             .current_dir(&project_root)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -1161,6 +1165,21 @@ mod tests {
 
         cleanup_local_buck_out(&repo_path);
         std::fs::remove_dir_all(&repo_path).unwrap();
+    }
+
+    #[test]
+    fn test_buck2_build_arguments_place_event_log_after_build_subcommand() {
+        let args = buck2_build_arguments("test-iso", &[TargetLabel::new("foo//bar:baz")]);
+        let build_pos = args.iter().position(|arg| arg == "build").unwrap();
+        let event_log_pos = args.iter().position(|arg| arg == "--event-log").unwrap();
+        let target_pos = args.iter().position(|arg| arg == "foo//bar:baz").unwrap();
+
+        assert_eq!(args[0], "--isolation-dir");
+        assert_eq!(args[1], "test-iso");
+        assert_eq!(args[build_pos], "build");
+        assert_eq!(args[event_log_pos + 1], EVENT_LOG_FILE);
+        assert!(build_pos < event_log_pos);
+        assert!(event_log_pos < target_pos);
     }
 
     #[test]
