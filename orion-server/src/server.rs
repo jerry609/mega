@@ -12,6 +12,7 @@ use common::{
 };
 use http::{HeaderValue, Method};
 use io_orbit::factory::ObjectStorageFactory;
+use jupiter::migration::apply_migrations;
 use sea_orm::{ActiveValue::Set, ColumnTrait, Database, EntityTrait, QueryFilter};
 use tower::ServiceBuilder;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
@@ -185,6 +186,11 @@ pub async fn start_server() {
             eprintln!("Database connection failed: {e}");
             std::process::exit(1);
         });
+
+    apply_migrations(&conn, false).await.unwrap_or_else(|e| {
+        eprintln!("Database migration failed: {e}");
+        std::process::exit(1);
+    });
 
     let port = orion_server_config.port;
 

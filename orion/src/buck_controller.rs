@@ -10,7 +10,7 @@ use std::{
 use anyhow::anyhow;
 use api_model::buck2::{
     status::Status,
-    types::{ProjectRelativePath, TaskPhase},
+    types::{BuildOutcome, ProjectRelativePath, TaskPhase},
     ws::{WSBuildContext, WSMessage, WSTargetBuildStatusEvent},
 };
 use common::config::BuildConfig;
@@ -45,6 +45,22 @@ const LOCAL_BUCK_OUT_ROOT: &str = "/tmp/orion-buck-out";
 const DEFAULT_PREHEAT_SHALLOW_DEPTH: usize = 3;
 static BUILD_CONFIG: Lazy<Option<BuildConfig>> = Lazy::new(load_build_config);
 
+#[derive(Debug, Clone)]
+pub struct BuildExecution {
+    pub success: bool,
+    pub exit_code: Option<i32>,
+    pub message: String,
+    pub outcome: Option<BuildOutcome>,
+}
+
+struct PreparedBuildAttempt {
+    mount_point: String,
+    mount_guard: MountGuard,
+    old_mount_guard: MountGuard,
+    old_project_root: PathBuf,
+    targets: Vec<TargetLabel>,
+}
+
 /// Mount an Antares overlay filesystem for a build job.
 ///
 /// Creates a new Antares overlay mount using scorpiofs. The underlying Dicfuse
@@ -59,15 +75,19 @@ static BUILD_CONFIG: Lazy<Option<BuildConfig>> = Lazy::new(load_build_config);
 /// Returns a tuple `(mountpoint, mount_id)` on success.
 pub async fn mount_antares_fs(
     job_id: &str,
+    repo_path: &str,
     cl: Option<&str>,
-) -> Result<(String, String), Box<dyn std::error::Error + Send + Sync>> {
+) -> anyhow::Result<(String, String)> {
     tracing::debug!(
-        "Preparing to mount Antares FS: job_id={}, cl={:?}",
+        "Preparing to mount Antares FS: job_id={}, repo_path={}, cl={:?}",
         job_id,
+        repo_path,
         cl
     );
 
-    let config = crate::antares::mount_job(job_id, cl).await?;
+    let config = crate::antares::mount_job(job_id, repo_path, cl)
+        .await
+        .map_err(|err| anyhow!(err.to_string()))?;
 
     let mountpoint = config.mountpoint.to_string_lossy().to_string();
     let mount_id = config.job_id.clone();
@@ -89,10 +109,12 @@ pub async fn mount_antares_fs(
 /// # Returns
 /// * `Ok(true)` - Unmount succeeded
 /// * `Err` - Unmount failed
-pub async fn unmount_antares_fs(mount_id: &str) -> Result<bool, Box<dyn Error + Send + Sync>> {
+pub async fn unmount_antares_fs(mount_id: &str) -> anyhow::Result<bool> {
     tracing::info!("Starting unmount for mount_id: {}", mount_id);
 
-    crate::antares::unmount_job(mount_id).await?;
+    crate::antares::unmount_job(mount_id)
+        .await
+        .map_err(|err| anyhow!(err.to_string()))?;
 
     tracing::info!("Unmount succeeded for mount_id: {}", mount_id);
     Ok(true)
@@ -425,7 +447,7 @@ fn is_retryable_mount_io_error(err: &io::Error) -> bool {
     err.kind() == io::ErrorKind::TimedOut || matches!(err.raw_os_error(), Some(107 | 116 | 5 | 2))
 }
 
-fn is_retryable_target_discovery_error(err: &anyhow::Error) -> bool {
+fn is_retryable_build_setup_error(err: &anyhow::Error) -> bool {
     let message = err.to_string();
     [
         "Transport endpoint is not connected",
@@ -434,6 +456,9 @@ fn is_retryable_target_discovery_error(err: &anyhow::Error) -> bool {
         "os error 116",
         "Failed to connect to buck daemon",
         "No such file or directory",
+        "Timed out waiting for mounted repo path",
+        "Timed out waiting for path",
+        "mount probe failed",
     ]
     .iter()
     .any(|needle| message.contains(needle))
@@ -891,6 +916,65 @@ impl Drop for MountGuard {
     }
 }
 
+async fn prepare_build_attempt(
+    id: &str,
+    repo: &str,
+    cl_arg: Option<&str>,
+    changes: &[Status<ProjectRelativePath>],
+    attempt: usize,
+) -> anyhow::Result<PreparedBuildAttempt> {
+    let id_for_old_repo = format!("{id}-old-{attempt}");
+    let (old_repo_mount_point, mount_id_old_repo) =
+        mount_antares_fs(&id_for_old_repo, repo, None).await?;
+    let guard_old_repo = MountGuard::new(mount_id_old_repo, id_for_old_repo);
+
+    let id_for_repo = format!("{id}-{attempt}");
+    let (repo_mount_point, mount_id) = mount_antares_fs(&id_for_repo, repo, cl_arg).await?;
+    let guard = MountGuard::new(mount_id, id_for_repo);
+
+    tracing::info!(
+        "[Task {}] Filesystem mounted successfully (attempt {}/{}).",
+        id,
+        attempt,
+        3
+    );
+
+    let old_project_root = PathBuf::from(&old_repo_mount_point);
+    let new_project_root = PathBuf::from(&repo_mount_point);
+
+    let preparation = async {
+        wait_for_repo_mount_ready(&old_project_root).await?;
+        wait_for_repo_mount_ready(&new_project_root).await?;
+        ensure_local_buck_out(&old_project_root)?;
+        ensure_local_buck_out(&new_project_root)?;
+
+        get_build_targets(
+            old_project_root.to_str().unwrap_or(&old_repo_mount_point),
+            new_project_root.to_str().unwrap_or(&repo_mount_point),
+            changes.to_vec(),
+        )
+        .await
+    }
+    .await;
+
+    match preparation {
+        Ok(targets) => Ok(PreparedBuildAttempt {
+            mount_point: repo_mount_point,
+            mount_guard: guard,
+            old_mount_guard: guard_old_repo,
+            old_project_root,
+            targets,
+        }),
+        Err(err) => {
+            cleanup_local_buck_out(&new_project_root);
+            cleanup_local_buck_out(&old_project_root);
+            guard.unmount().await;
+            guard_old_repo.unmount().await;
+            Err(err)
+        }
+    }
+}
+
 /// Executes buck build with filesystem mounting and output streaming.
 ///
 /// Process flow:
@@ -916,93 +1000,36 @@ pub async fn build(
     cl: String,
     sender: UnboundedSender<WSMessage>,
     changes: Vec<Status<ProjectRelativePath>>,
-) -> Result<ExitStatus, Box<dyn Error + Send + Sync>> {
+) -> Result<BuildExecution, Box<dyn Error + Send + Sync>> {
     tracing::info!("[Task {}] Building in repo {}", id, repo);
 
     let task_id = id.trim();
-    // Handle empty cl string as None to mount the base repo without a CL layer.
     let cl_trimmed = cl.trim();
     let cl_arg = (!cl_trimmed.is_empty()).then_some(cl_trimmed);
-
-    // `repo_prefix` is the relative path from monorepo root to the buck2 project.
-    // e.g., repo="/project/git-internal/git-internal" → repo_prefix="project/git-internal/git-internal"
-    let repo_prefix = repo.strip_prefix('/').unwrap_or(&repo);
-
-    // Changes are already relative to the sub-project (buck2 project root).
-    // Do NOT prefix them with repo_prefix — buck2 runs from the sub-project dir.
+    let repo = if repo.trim().is_empty() {
+        "/".to_string()
+    } else {
+        repo
+    };
 
     const MAX_TARGETS_ATTEMPTS: usize = 3;
-    let mut mount_point = None;
-    let mut mount_guard = None;
-    let mut mount_guard_old_repo = None;
-    let mut old_project_root_saved = None;
-    let mut targets: Vec<TargetLabel> = Vec::new();
+    let mut prepared_attempt = None;
     let mut last_targets_error: Option<anyhow::Error> = None;
 
     for attempt in 1..=MAX_TARGETS_ATTEMPTS {
-        // Mount TWO independent views of the same monorepo:
-        //
-        //   old_repo  — base revision (no CL), used as the "before" snapshot
-        //   new_repo  — base + CL layer,       used as the "after"  snapshot
-        //
-        // Both mount the same monorepo root (`path = "/"`), but each call to
-        // `mount_antares_fs()` creates a **new UUID** on the Antares side, so
-        // the mountpoints are different (e.g. `/var/lib/antares/mounts/<uuid>`).
-        // This is why `--isolation-dir` (derived from the mountpoint path) is
-        // necessary — it prevents Buck2 daemons from cross-contaminating
-        // between the two mounts.  See `buck2_isolation_dir()` for details.
-        let id_for_old_repo = format!("{id}-old-{attempt}");
-        let (old_repo_mount_point, mount_id_old_repo) =
-            mount_antares_fs(&id_for_old_repo, None).await?;
-        let guard_old_repo = MountGuard::new(mount_id_old_repo.clone(), id_for_old_repo);
-
-        let id_for_repo = format!("{id}-{attempt}");
-        let (repo_mount_point, mount_id) = mount_antares_fs(&id_for_repo, cl_arg).await?;
-        let guard = MountGuard::new(mount_id.clone(), id_for_repo);
-
-        tracing::info!(
-            "[Task {}] Filesystem mounted successfully (attempt {}/{}).",
-            id,
-            attempt,
-            MAX_TARGETS_ATTEMPTS
-        );
-
-        // Resolve the sub-project paths within each mount for buck2.
-        let old_project_root = PathBuf::from(&old_repo_mount_point).join(repo_prefix);
-        let new_project_root = PathBuf::from(&repo_mount_point).join(repo_prefix);
-
-        wait_for_repo_mount_ready(&old_project_root).await?;
-        wait_for_repo_mount_ready(&new_project_root).await?;
-        ensure_local_buck_out(&old_project_root)?;
-        ensure_local_buck_out(&new_project_root)?;
-
-        match get_build_targets(
-            old_project_root.to_str().unwrap_or(&old_repo_mount_point),
-            new_project_root.to_str().unwrap_or(&repo_mount_point),
-            changes.clone(),
-        )
-        .await
-        {
-            Ok(found_targets) => {
-                old_project_root_saved = Some(old_project_root.clone());
-                mount_point = Some(repo_mount_point);
-                mount_guard = Some(guard);
-                mount_guard_old_repo = Some(guard_old_repo);
-                targets = found_targets;
+        match prepare_build_attempt(&id, &repo, cl_arg, &changes, attempt).await {
+            Ok(prepared) => {
+                prepared_attempt = Some(prepared);
                 break;
             }
-            Err(e) => {
-                cleanup_local_buck_out(&new_project_root);
-                cleanup_local_buck_out(&old_project_root);
-                guard.unmount().await;
-                guard_old_repo.unmount().await;
-                let retryable = is_retryable_target_discovery_error(&e);
-                last_targets_error = Some(e);
+            Err(err) => {
+                let retryable = is_retryable_build_setup_error(&err);
+                last_targets_error = Some(err);
                 if attempt == MAX_TARGETS_ATTEMPTS || !retryable {
                     break;
                 }
                 tracing::warn!(
-                    "[Task {}] Failed to get build targets (attempt {}/{}): {}. Retrying with fresh mounts...",
+                    "[Task {}] Build setup failed (attempt {}/{}): {}. Retrying with fresh mounts...",
                     id,
                     attempt,
                     MAX_TARGETS_ATTEMPTS,
@@ -1012,8 +1039,14 @@ pub async fn build(
         }
     }
 
-    let mount_point = match mount_point {
-        Some(value) => value,
+    let PreparedBuildAttempt {
+        mount_point,
+        mount_guard,
+        old_mount_guard: mount_guard_old_repo,
+        old_project_root,
+        targets,
+    } = match prepared_attempt {
+        Some(prepared) => prepared,
         None => {
             let err = last_targets_error
                 .map(|e| anyhow!("Error getting build targets: {e}"))
@@ -1034,20 +1067,32 @@ pub async fn build(
             return Err(err.into());
         }
     };
-    let mount_guard = mount_guard.ok_or("Mount guard missing after target discovery")?;
-    let mount_guard_old_repo =
-        mount_guard_old_repo.ok_or("Old repo mount guard missing after target discovery")?;
-    let old_project_root =
-        old_project_root_saved.ok_or("Old repo project root missing after target discovery")?;
+
+    if targets.is_empty() {
+        let skip_output = "No build targets resolved; skipping buck2 build.".to_string();
+        let _ = sender.send(WSMessage::TaskBuildOutput {
+            build_id: id.clone(),
+            output: skip_output,
+        });
+
+        let new_project_root = PathBuf::from(&mount_point);
+        cleanup_local_buck_out(&new_project_root);
+        cleanup_local_buck_out(&old_project_root);
+        mount_guard.unmount().await;
+        mount_guard_old_repo.unmount().await;
+
+        return Ok(BuildExecution {
+            success: true,
+            exit_code: Some(0),
+            message: "Build skipped: no targets".to_string(),
+            outcome: Some(BuildOutcome::SkippedNoTargets),
+        });
+    }
 
     let build_result = async {
-        // Run buck2 build from the sub-project directory, not the monorepo root.
-        // This ensures buck2 uses the sub-project's .buckconfig and PACKAGE files.
-        let project_root = PathBuf::from(&mount_point).join(repo_prefix);
+        let project_root = PathBuf::from(&mount_point);
         let isolation_dir = buck2_isolation_dir(&project_root)?;
         let mut cmd = Command::new("buck2");
-        // `--event-log` is a `buck2 build` subcommand flag, so it must appear
-        // after `build` instead of before the subcommand.
         let cmd = cmd
             .args(buck2_build_arguments(&isolation_dir, &targets))
             .current_dir(&project_root)
@@ -1058,14 +1103,15 @@ pub async fn build(
 
         let mut child = cmd.spawn()?;
 
-        if let Err(e) = sender.send(WSMessage::TaskPhaseUpdate {
+        if let Err(err) = sender.send(WSMessage::TaskPhaseUpdate {
             build_id: id.clone(),
             phase: TaskPhase::RunningBuild,
         }) {
-            tracing::error!("Failed to send RunningBuild phase update: {}", e);
+            tracing::error!("Failed to send RunningBuild phase update: {}", err);
         }
 
-        let target_build_track = start_build_status_tracker(&project_root, sender.clone(), cl_trimmed, task_id);
+        let target_build_track =
+            start_build_status_tracker(&project_root, sender.clone(), cl_trimmed, task_id);
 
         let stdout = child.stdout.take().unwrap();
         let stderr = child.stderr.take().unwrap();
@@ -1084,8 +1130,8 @@ pub async fn build(
                             }
                         },
                         Ok(None) => break,
-                        Err(e) => {
-                            tracing::error!("[Task {}] Error reading stdout: {}", id, e);
+                        Err(err) => {
+                            tracing::error!("[Task {}] Error reading stdout: {}", id, err);
                             break;
                         }
                     }
@@ -1099,8 +1145,8 @@ pub async fn build(
                             }
                         },
                         Ok(None) => break,
-                        Err(e) => {
-                            tracing::error!("[Task {}] Error reading stderr: {}", id, e);
+                        Err(err) => {
+                            tracing::error!("[Task {}] Error reading stderr: {}", id, err);
                             break;
                         },
                     }
@@ -1123,11 +1169,20 @@ pub async fn build(
         let _ = target_build_track.tail_handle.await;
         let _ = target_build_track.process_handle.await;
         tracing::info!("Target build status track finished");
-        Ok(status)
+
+        Ok(BuildExecution {
+            success: status.success(),
+            exit_code: status.code(),
+            message: format!(
+                "Build {}",
+                if status.success() { "succeeded" } else { "failed" }
+            ),
+            outcome: Some(BuildOutcome::Built),
+        })
     }
     .await;
 
-    let new_project_root = PathBuf::from(&mount_point).join(repo_prefix);
+    let new_project_root = PathBuf::from(&mount_point);
     cleanup_local_buck_out(&new_project_root);
     cleanup_local_buck_out(&old_project_root);
     mount_guard.unmount().await;
@@ -1178,27 +1233,31 @@ mod tests {
     }
 
     #[test]
-    fn test_retryable_target_discovery_error_detects_fuse_disconnects() {
-        assert!(is_retryable_target_discovery_error(&anyhow!(
+    fn test_retryable_build_setup_error_detects_fuse_disconnects() {
+        assert!(is_retryable_build_setup_error(&anyhow!(
             "Fail to get cells: Transport endpoint is not connected (os error 107)"
         )));
-        assert!(is_retryable_target_discovery_error(&anyhow!(
+        assert!(is_retryable_build_setup_error(&anyhow!(
             "buck2 targets failed: Stale file handle (os error 116)"
         )));
-        assert!(!is_retryable_target_discovery_error(&anyhow!(
+        assert!(is_retryable_build_setup_error(&anyhow!(
+            "Timed out waiting for mounted repo path \"/tmp/foo\" to become ready"
+        )));
+        assert!(!is_retryable_build_setup_error(&anyhow!(
             "logical config mismatch"
         )));
     }
 
     #[tokio::test]
-    async fn test_wait_for_repo_mount_ready_retries_until_dir_exists() {
+    async fn test_wait_for_repo_mount_ready_retries_until_buckconfig_exists() {
         let base = std::env::temp_dir().join(format!("orion-mount-ready-{}", Uuid::new_v4()));
         let repo_path = base.join("repo");
         let repo_path_for_task = repo_path.clone();
 
+        std::fs::create_dir_all(&repo_path).unwrap();
+
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(50)).await;
-            std::fs::create_dir_all(&repo_path_for_task).unwrap();
             std::fs::write(repo_path_for_task.join(".buckconfig"), b"[repositories]\n").unwrap();
         });
 
@@ -1214,10 +1273,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_wait_for_repo_mount_ready_times_out_for_missing_dir() {
-        let repo_path = std::env::temp_dir()
-            .join(format!("orion-mount-timeout-{}", Uuid::new_v4()))
-            .join("repo");
+    async fn test_wait_for_repo_mount_ready_times_out_for_missing_buckconfig() {
+        let base = std::env::temp_dir().join(format!("orion-mount-timeout-{}", Uuid::new_v4()));
+        let repo_path = base.join("repo");
+        std::fs::create_dir_all(&repo_path).unwrap();
 
         let err = wait_for_repo_mount_ready_with_retry(
             &repo_path,
@@ -1231,6 +1290,8 @@ mod tests {
             err.to_string()
                 .contains("Timed out waiting for mounted repo path")
         );
+
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[tokio::test]
@@ -1267,7 +1328,7 @@ mod tests {
         }
 
         let job_id = format!("codex-mount-ready-{}", Uuid::new_v4());
-        let (mountpoint, mount_id) = mount_antares_fs(&job_id, None).await.unwrap();
+        let (mountpoint, mount_id) = mount_antares_fs(&job_id, "/", None).await.unwrap();
         let project_root = PathBuf::from(&mountpoint);
         let isolation_dir = "codex-mount-ready-test";
 

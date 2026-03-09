@@ -312,6 +312,7 @@ async fn process_server_message(
                                             success: false,
                                             exit_code: None,
                                             message,
+                                            outcome: None,
                                         })
                                     {
                                         tracing::error!(

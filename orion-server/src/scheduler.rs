@@ -388,23 +388,25 @@ impl TaskScheduler {
             .await
             .map_err(|e| e.to_string())?;
 
-        // Persist build before queueing so duplicate submissions can be resolved idempotently.
-        if builds::Entity::find_by_id(build_event_id)
-            .one(&self.conn)
-            .await
-            .map_err(|e| e.to_string())?
-            .is_none()
-        {
-            builds::Model::insert_build(
-                build_event_id,
-                task_id,
-                target_model.id,
-                repo.clone(),
-                &self.conn,
-            )
-            .await
-            .map_err(|e| e.to_string())?;
-        }
+        crate::model::build_records::ensure_orion_task_record(
+            &self.conn,
+            task_id,
+            cl_link,
+            &repo,
+            &changes,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+
+        crate::model::build_records::ensure_build_records(
+            &self.conn,
+            build_event_id,
+            task_id,
+            target_model.id,
+            &repo,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
 
         let event = BuildEventPayload::new(
             build_event_id,

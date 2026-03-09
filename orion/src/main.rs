@@ -5,14 +5,20 @@ mod buck_controller;
 pub mod repo;
 mod ws;
 
+use tracing::level_filters::LevelFilter;
+use tracing_subscriber::{filter::Targets, layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
 
 #[tokio::main]
 async fn main() {
     // Initialize structured logging
-    tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .with_target(true)
+    let log_targets = Targets::new()
+        .with_target("rfuse3::raw::session", LevelFilter::ERROR)
+        .with_default(LevelFilter::INFO);
+
+    tracing_subscriber::registry()
+        .with(log_targets)
+        .with(tracing_subscriber::fmt::layer().with_target(true))
         .init();
 
     // Load environment variables from .env file

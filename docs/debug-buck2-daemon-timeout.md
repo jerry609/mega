@@ -3477,3 +3477,389 @@ if needs_lazy {
 | 14 | Zombie scorpio 进程 | L3 | 已知 | PPID=1, 等 init reap |
 | 15 | e2e 测试 teardown 不完整 | L3 | 已知 | 需要 scorpiofs 侧改进 |
 | 16 | state.toml 与实际挂载不同步 | L3 | 已知 | 需要 antares manager 侧改进 |
+
+## Part 11: Orion 真实回归 + 新修复记录 (2026-03-09)
+
+### 1) 新发现 A：`orion-server` 能启动，但目标库 schema 没自动迁移
+
+#### 现象
+
+第一次真实发 `/task` 时，服务端直接返回：
+
+- `Failed to insert task into database: relation "tasks" does not exist`
+
+根因不是 PostgreSQL 没装，而是：
+
+- `orion-server` 直接使用 `orion_server.db_url` 建连；
+- 启动路径没有复用 `jupiter` 的自动迁移逻辑；
+- 因此 `postgres://postgres:postgres@localhost/orion` 是空库，server 虽然成功监听，但真正进接口就失败。
+
+#### 修复
+
+在 `orion-server/src/server.rs` 启动建连后，直接调用 `jupiter::migration::apply_migrations(&conn, false)`。
+
+#### 验证
+
+- 重启后看到 `Applying all pending migrations` / `No pending migrations`
+- `/task` 不再因为 `tasks` 表不存在而失败
+
+---
+
+### 2) 新发现 B：`/task` 的同 `build_id` 并发幂等在 immediate path 上有 race
+
+#### 修复前复现
+
+对同一个 `build_id` 并发 POST 5 次，出现了：
+
+- 最终 `builds` 里只有 1 条记录；
+- 但 `tasks` 被创建了多条；
+- 有请求返回 `duplicate key value violates unique constraint "builds_pkey"`；
+- 日志中出现多次 “Created build record / dispatched immediately”。
+
+这说明旧逻辑属于典型的：
+
+- 先查 `find_existing_build_result()`；
+- 再各自创建 `task_id` / `target` / `build`；
+- 在并发窗口里会被同一个 `build_id` 穿透。
+
+#### 修复
+
+在 `orion-server/src/api.rs` 为同一个 `build_id` 新增 process-local 串行化锁：
+
+- `/task` 在解析出 `build_id` 后，先拿 per-build 锁，再执行完整提交逻辑；
+- `/retry-build` 也复用同一把锁；
+- 锁作用范围覆盖“查重 → 插入 task/build → dispatch / queue”整段关键路径。
+
+这次没有直接上更重的 DB 事务/分布式锁，而是优先做结构最小、收益最大的串行化收口：
+
+- 当前真实环境中 `orion-server` 是单实例进程；
+- 问题就发生在同进程并发 handler 之间；
+- 先把 immediate-dispatch 这条最容易穿透的路径收敛住，收益立刻可验证。
+
+#### 修复后回归
+
+同 `build_id` 并发 5 次结果变为：
+
+- 1 次返回 `dispatched`
+- 4 次返回同一个 `task_id` + `building`
+- `builds` 表只有 1 条
+- `tasks` 表也只有 1 条
+
+结论：**服务端幂等在真实 immediate path 下已生效。**
+
+---
+
+### 3) 新发现 C：repo ready probe 被弱化后，会把“目录刚出现”误判为 Buck project ready
+
+#### 现象
+
+本次真实 worker 链路里曾出现：
+
+- `Couldn't find a buck project root ... Expected to find a .buckconfig file`
+- 或更早的 `Timed out waiting for mounted repo path ... No such file or directory`
+
+进一步排查发现：
+
+- mount 根目录很快就会出现；
+- 但 `.buckconfig` / `.buckroot` 的可见性仍有窗口期；
+- 旧版 `probe_repo_mount()` 只检查了：
+  - 目录 metadata
+  - `read_dir`
+  - `current_dir(true)`
+- **没有验证 `.buckconfig` 本身可 stat/open**。
+
+因此它会把“FUSE mount 已挂上，但 Buck root 关键文件还没 ready”的状态误判为 ready。
+
+#### 修复
+
+在 `orion/src/buck_controller.rs` 中加强 `probe_repo_mount()`：
+
+- 目录必须存在且可读；
+- `.buckconfig` 必须存在且是文件；
+- `.buckconfig` 必须可以 `open()`；
+- 再做 `current_dir` probe。
+
+同时把测试修正为真正覆盖该语义：
+
+- `test_wait_for_repo_mount_ready_retries_until_buckconfig_exists`
+- `test_wait_for_repo_mount_ready_times_out_for_missing_buckconfig`
+
+#### 验证
+
+- 精确单测 2 个均通过；
+- 真实挂载中，`find` 可以看到 mount 根目录最终确实存在 `.buckconfig` / `.buckroot`；
+- 新 probe 不再把“目录刚出现”误判为 ready；
+- 真实任务能够继续推进到 `Get cells` / target discovery / build 阶段。
+
+---
+
+### 4) 真实链路回归结果
+
+#### 4.1 单任务真实链路
+
+修复后成功跑通：
+
+- `orion-server -> worker -> Scorpiofs/Antares mount -> Buck2 -> unmount`
+- 未再出现：
+  - `disk I/O error`
+  - `Error code 3850: I/O error in the advisory file locking layer`
+  - `Error initializing DaemonStateData`
+
+说明：
+
+- host-local `buck-out` 隔离方案仍然有效；
+- Buck2 daemon/materializer 的写状态不再落在 FUSE upper layer。
+
+#### 4.2 同 `build_id` 重复触发
+
+已验证：
+
+- 同 `build_id` 并发 5 次，仅 1 次真实进入执行；
+- 其余请求返回同一任务上下文与运行态；
+- 不再出现重复 `task` / 重复 dispatch / `builds_pkey` 冲突。
+
+#### 4.3 `retry-build`
+
+已验证：
+
+- 对已完成 build 调用 `/retry-build`，服务端返回 `Build retry dispatched immediately to worker`
+- worker 实际收到同一个 build 的重试任务并重新执行。
+
+#### 4.4 worker 重启 / 断连后任务不丢
+
+已验证：
+
+- worker 不可用时，新任务返回 `queued`
+- 新 worker 注册后，server 日志出现：
+  - `Queued task ... dispatched to worker e2e-worker-1 (lease started)`
+- 说明队列中的 build 没有丢失，worker 重连后能继续消费。
+
+---
+
+### 5) 这轮修复后的剩余观察项
+
+#### 5.1 `rfuse3::raw::session: The data is not 4096 bytes aligned`
+
+- 目前仍能在真实链路看到；
+- 这次没有证据表明它直接导致功能错误；
+- 但它说明 FUSE/raw session 层仍有值得继续核查的实现细节。
+
+建议：作为 Scorpiofs/FUSE 层的独立稳定性事项追踪，不与这次幂等/daemon 修复混在一起。
+
+#### 5.2 `NO BUILD TARGET PATTERNS SPECIFIED`
+
+- 当前某些 diff 场景会走到 “没有解析出目标” 的 no-op build；
+- 现在系统把它当成 exit code 0 成功结束；
+- 这不一定是错，但从产品语义看，后续可能更适合把它单独标记成：
+  - `no_targets`
+  - 或 `skipped`
+
+否则用户看到“成功”时，不一定知道其实没有真正 build 任何 target。
+
+#### 5.3 `retry-build` 目前仍复用原 build_id
+
+- 本次通过 per-build lock 保证了不会并发重入；
+- 但从“重试历史可观察性”角度看，复用原 build row 会压缩重试语义；
+- 如果后续希望更清晰的 retry lineage，仍建议把 retry 升级为新的 build_event / build attempt 模型。
+
+---
+
+### 6) 本轮新增/更新的问题表
+
+| # | 问题 | 层 | 状态 | 备注 |
+|---|------|-----|------|------|
+| 17 | `orion-server` 连接 `orion` 库但未自动迁移 | Server/DB | **已修复** | 启动时接入 `jupiter::migration::apply_migrations` |
+| 18 | `/task` immediate path 的同 `build_id` 并发存在 race | Server/幂等 | **已修复** | `/task` + `/retry-build` 接入 per-build 串行化锁 |
+| 19 | mount ready probe 只验目录，不验 `.buckconfig` | L1 | **已修复** | `probe_repo_mount()` 强化 + 单测补齐 |
+| 20 | 真实链路偶发“挂载根目录 ready 慢于 mount 返回” | L1 | **已缓解** | probe 更强，但 Scorpiofs 上游 ready 合约仍建议继续补强 |
+| 21 | `rfuse3` 4096 bytes aligned warning | L1/FUSE | 已知 | 暂未证明是功能错误，建议独立追踪 |
+| 22 | `NO BUILD TARGET PATTERNS SPECIFIED` 仍被视作成功 | 产品/语义 | 已知 | 后续可考虑 `no_targets` / `skipped` 状态 |
+| 23 | retry 仍复用原 build_id，历史语义偏弱 | 模型设计 | 已知 | 本次未改数据模型 |
+
+### 7) 当前结论
+
+到这一步，可以确认三件事：
+
+1. **Buck2 daemon / advisory lock / SQLite I/O 这条问题链已经被 host-local `buck-out` 隔离住了；**
+2. **同 `build_id` 并发触发的服务端幂等已经在真实 worker 链路上跑通；**
+3. **Scorpiofs/FUSE 的 ready 语义仍是最底层的不稳定源，但 Orion 侧 probe 已经补强，能显著减少误判与早撞。**
+
+后续如果继续推进，优先级建议是：
+
+- P1：把 Scorpiofs 上游 ready 合约继续做强；
+- P2：把 `no_targets` 从“成功”里分离成显式状态；
+- P3：如果要做更完整的 retry lineage，再引入新的 build attempt 模型。
+
+---
+
+## 2026-03-09 晚间补充：结构化收口与真实回归结果
+
+### A. 本轮继续收口的三个点
+
+#### A.1 Scorpiofs：把 Buck ready contract 收回到 mount 语义内部
+
+这次没有继续在 Orion 里堆补丁，而是把“Buck repo 什么时候算 ready”往 Scorpiofs/Antares 里回收了一层：
+
+- `AntaresManager` 新增 `mount_job_for_path_with_ready_path(...)` / `mount_job_at_for_path_with_ready_path(...)`；
+- Orion 侧挂载 repo 时明确传入 `/.buckconfig` 作为 ready sentinel；
+- Scorpiofs 在 mount 返回前，先等 Dicfuse 里的该路径可遍历，再对实际 mountpoint 上的同一路径做一次 post-mount probe；
+- Orion 侧 `wait_for_repo_mount_ready()` 因此退回成“挂载存活/目录可进入”检查，不再重复承担 Buck root 判定。
+
+这样做的原因是：
+
+- 之前 `old-repo mount ready timeout: ... old-1 ... No such file or directory` 的根因，不是 Orion 不会等，而是 **ready contract 放错层**；
+- Buck 的项目根判定依赖 `/.buckconfig`，这个约束应该属于“给 Buck 挂出的 repo 视图是否 ready”，所以应由 Scorpiofs mount contract 显式表达；
+- Orion 仍保留 mount liveness probe 和 retry，用于兜底 FUSE session 后续失活，而不是继续承担 repo-root 语义。
+
+#### A.2 Orion Server：把新旧 schema 之间的 build/task 状态打通
+
+本轮又暴露出一个之前没收干净的问题：
+
+- `/task` 老链路写的是 `tasks` / `builds`；
+- `/v2/build-state` / `/v2/latest_build_result` 读的是 `orion_tasks` / `build_events`；
+- 因而真实链路里会出现：
+  - `builds` 表里已有记录；
+  - 但 `build_events` 没有对应行；
+  - 接口返回 `Build not found` / `Task not found`。
+
+这次的修复不是简单在一个分支点上补一条 insert，而是做了两件事：
+
+1. 增加共享 helper：
+   - `orion-server/src/model/build_records.rs`
+   - `ensure_orion_task_record(...)`
+   - `ensure_build_records(...)`
+2. 让下面三条真实链路都复用同一套持久化逻辑：
+   - `/task` immediate dispatch
+   - `/task` queued dispatch
+   - `/retry-build` immediate path
+
+同时，`/v2/build-state` 和 `/v2/latest_build_result` 增加了 **legacy fallback**：
+
+- 优先读 `build_events` / `orion_tasks`；
+- 若没有，再回退读 `builds` / `tasks`；
+- queued / leased build 显式返回 `Pending`；
+- `Build skipped: no targets` 返回 `Skipped`。
+
+这样做之后，即使历史 build 是老 schema 写出来的，也不会再因为读表不一致而“查不到状态”。
+
+#### A.3 `rfuse3::raw::session: The data is not 4096 bytes aligned`
+
+这次继续沿着根因看下来，确认结论如下：
+
+- 这条 warning 的直接打印点在 `rfuse3` 的 `Session::handle_write`；
+- Scorpiofs / Orion 本身并没有把 mount 配成 `direct_io=true`；
+- 这条 warning 更接近 **rfuse3 对 write buffer alignment 的过度告警**，而不是当前链路里的功能性错误证据。
+
+因此这次采取的是两层处理：
+
+1. **局部止血**：
+   - 在 `orion/src/main.rs` 给 `rfuse3::raw::session` 单独降到 `ERROR`；
+   - 真实 worker 日志里不再持续刷这条 warning。
+2. **文档定责**：
+   - 根因仍归到 `rfuse3` 上游；
+   - 若后续要彻底消掉，需要提上游 patch，而不是继续在 Orion/Scorpiofs 业务层加绕路逻辑。
+
+也就是说：这次是**把噪音从业务链路里收掉**，但没有伪装成“已经在业务代码里修掉了 rfuse3 本身”。
+
+### B. 真实回归结果
+
+#### B.1 同 `build_id` 并发 5 次
+
+真实请求：
+
+- `build_id = 8215edf7-eae2-485d-8931-5ad2315f520c`
+
+结果：
+
+- 1 次返回 `dispatched`
+- 其余 4 次返回 `building`
+- 最终只有：
+  - `builds` 中 1 行
+  - `build_events` 中 1 行
+- `/v2/build-state/{build_id}` 返回：`"Skipped"`
+- `/v2/latest_build_result/{task_id}` 返回：`"Skipped"`
+
+结论：
+
+- 同 `build_id` 幂等/串行化生效；
+- 状态接口与持久化表不再脱节；
+- 本轮没有再复现 `old-1 mount ready timeout`。
+
+#### B.2 `retry-build`
+
+对上面的 build 做真实 `/retry-build`：
+
+- 返回：`Build retry dispatched immediately to worker`
+- 最终：
+  - `builds.retry_count = 1`
+  - `build_events.retry_count = 1`
+  - `/v2/build-state/{build_id}` 返回：`"Skipped"`
+
+结论：
+
+- immediate retry path 也已接入双写逻辑；
+- 不再出现“重试成功执行了，但 build_events 查不到”的问题。
+
+#### B.3 worker 不在场 -> 入队 -> 重启 worker
+
+真实回归：
+
+1. 先停掉 worker；
+2. 发 `/task`，服务端返回 `queued`；
+3. `/v2/build-state/{build_id}` 立即返回 `"Pending"`；
+4. 再拉起 worker；
+5. build 被消费并最终落成 `"Skipped"`；
+6. 最终：
+   - `builds` 中 1 行
+   - `build_events` 中 1 行
+
+结论：
+
+- worker 不在时任务不会“看起来接收了但查不到”；
+- worker 恢复后任务会继续执行，且没有重复 build 记录。
+
+### C. 当前仍观察到但尚未继续深挖的点
+
+#### C.1 `buck audit cell` 在真实 FUSE 视图上仍偏慢
+
+这轮几次真实回归里，构建最终都成功落成 `Skipped`，但 target discovery 里的 `Get cells` 阶段在真实挂载视图上仍然可能花一分钟以上。
+
+当前判断：
+
+- 这不再是 L1 那种“ready 不够强导致立即 ENOENT / ENOTCONN”的问题；
+- 更像是 Buck2 在真实 FUSE 视图上的遍历/解析延迟较高；
+- 属于 **性能/时延** 观察项，不是本轮要解决的“状态错乱 / 接口查不到 / ready contract 太弱”这一类一致性故障。
+
+### D. 本轮代码落点
+
+#### D.1 Scorpiofs
+
+- `src/antares/mod.rs`
+- `src/daemon/antares.rs`
+
+#### D.2 Orion Worker
+
+- `orion/src/antares.rs`
+- `orion/src/buck_controller.rs`
+- `orion/src/main.rs`
+
+#### D.3 Orion Server
+
+- `orion-server/src/model/build_records.rs`
+- `orion-server/src/model/mod.rs`
+- `orion-server/src/scheduler.rs`
+- `orion-server/src/api.rs`
+
+### E. 这次为什么算“小范围重构”，不是继续堆补丁
+
+因为这次真正收的是两个“边界错位”：
+
+1. **ready contract 错位**
+   - 之前 Buck root ready 的判断散落在 Orion；
+   - 现在收回到 Scorpiofs mount contract。
+
+2. **schema source-of-truth 错位**
+   - 之前 `/task` 写老表，`/v2/*` 读新表；
+   - 现在通过双写 helper + read fallback 把边界补齐。
+
+所以这轮修改的目标不是“再多挡几个报错字符串”，而是把语义真正放回各自该在的层里。

@@ -12,8 +12,9 @@ use api_model::buck2::{
     api::{OrionBuildResult, OrionServerResponse, RetryBuildRequest, TaskBuildRequest},
     status::Status,
     types::{
-        LogErrorResponse, LogEvent, LogLinesResponse, LogReadMode, ProjectRelativePath,
-        TargetLogLinesResponse, TargetLogQuery, TargetStatusResponse, TaskHistoryQuery, TaskPhase,
+        BuildOutcome, LogErrorResponse, LogEvent, LogLinesResponse, LogReadMode,
+        ProjectRelativePath, TargetLogLinesResponse, TargetLogQuery, TargetStatusResponse,
+        TaskHistoryQuery, TaskPhase,
     },
     ws::{WSMessage, WSTargetBuildStatusEvent},
 };
@@ -24,7 +25,7 @@ use axum::{
         ws::{Message, Utf8Bytes, WebSocket},
     },
     http::StatusCode,
-    response::{IntoResponse, Sse, sse::Event},
+    response::{IntoResponse, Response, Sse, sse::Event},
     routing::{any, get, post},
 };
 use callisto::{sea_orm_active_enums::OrionTargetStatusEnum, target_build_status};
@@ -40,7 +41,7 @@ use sea_orm::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::{
-    RwLock,
+    Mutex, RwLock,
     mpsc::{self, UnboundedSender},
     watch,
 };
@@ -88,6 +89,7 @@ pub struct AppState {
     pub conn: DatabaseConnection,
     pub log_service: LogService,
     pub target_status_cache: TargetStatusCache,
+    submission_locks: Arc<DashMap<String, Arc<Mutex<()>>>>,
 
     shutdown_tx: watch::Sender<bool>,
 }
@@ -101,6 +103,7 @@ impl AppState {
     ) -> Self {
         let workers = Arc::new(DashMap::new());
         let active_builds = Arc::new(DashMap::new());
+        let submission_locks = Arc::new(DashMap::new());
         let scheduler = TaskScheduler::new(conn.clone(), workers, active_builds, queue_config);
         let target_status_cache = TargetStatusCache::new();
 
@@ -111,7 +114,21 @@ impl AppState {
             conn,
             log_service,
             target_status_cache,
+            submission_locks,
             shutdown_tx,
+        }
+    }
+
+    fn build_submission_lock(&self, build_id: &str) -> Arc<Mutex<()>> {
+        self.submission_locks
+            .entry(build_id.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    fn cleanup_build_submission_lock(&self, build_id: &str, lock: &Arc<Mutex<()>>) {
+        if Arc::strong_count(lock) == 2 {
+            self.submission_locks.remove(build_id);
         }
     }
 
@@ -605,6 +622,32 @@ pub async fn task_handler(
         None => None,
     };
 
+    let submission_lock = requested_build_id.map(|build_id| {
+        let build_id_str = build_id.to_string();
+        let lock = state.build_submission_lock(&build_id_str);
+        (build_id_str, lock)
+    });
+    let submission_guard = if let Some((_, lock)) = &submission_lock {
+        Some(lock.lock().await)
+    } else {
+        None
+    };
+
+    let response = task_handler_inner(state.clone(), req, requested_build_id).await;
+
+    drop(submission_guard);
+    if let Some((build_id_str, lock)) = submission_lock.as_ref() {
+        state.cleanup_build_submission_lock(build_id_str, lock);
+    }
+
+    response
+}
+
+async fn task_handler_inner(
+    state: AppState,
+    req: TaskBuildRequest,
+    requested_build_id: Option<Uuid>,
+) -> Response {
     // Idempotency short-circuit: if this build id already exists, return its status.
     if let Some(build_id) = requested_build_id
         && let Some((task_id, existing)) = find_existing_build_result(&state, build_id).await
@@ -804,38 +847,54 @@ async fn handle_immediate_task_dispatch_v2(
         started_at: start_at,
     };
 
-    // Store build event using BuildInfo structure
-    match callisto::build_events::Model::insert_build(
-        build_event_id,
-        task_id,
-        repo.to_string(),
+    if let Err(e) = crate::model::build_records::ensure_orion_task_record(
         &state.conn,
+        task_id,
+        cl_link,
+        repo,
+        &changes,
     )
     .await
     {
-        Ok(_) => {
-            tracing::info!(
-                "Created build event record in DB with ID {} for task {}",
-                build_info.event_payload.build_event_id,
-                task_id,
-            );
-        }
-        Err(e) => {
-            tracing::error!(
-                "Failed to insert build event into DB for task {} exit with error: {}",
-                task_id,
-                e
-            );
-            state.scheduler.release_worker(&chosen_id).await;
-            return OrionBuildResult {
-                build_id: "".to_string(),
-                status: "error".to_string(),
-                message: format!(
-                    "Failed to insert build event into database for task {}: {}",
-                    task_id, e
-                ),
-            };
-        }
+        tracing::error!(
+            "Failed to persist orion task record for task {}: {}",
+            task_id,
+            e
+        );
+        state.scheduler.release_worker(&chosen_id).await;
+        return OrionBuildResult {
+            build_id: "".to_string(),
+            status: "error".to_string(),
+            message: format!(
+                "Failed to persist orion task record for task {}: {}",
+                task_id, e
+            ),
+        };
+    }
+
+    if let Err(e) = crate::model::build_records::ensure_build_records(
+        &state.conn,
+        build_event_id,
+        task_id,
+        target_id,
+        repo,
+    )
+    .await
+    {
+        tracing::error!(
+            "Failed to persist build records for task {}: {}",
+            task_id,
+            e
+        );
+        state.scheduler.release_worker(&chosen_id).await;
+        return OrionBuildResult {
+            build_id: "".to_string(),
+            status: "error".to_string(),
+            message: format!(
+                "Failed to persist build records for task {}: {}",
+                task_id, e
+            ),
+        };
     }
 
     return activate_worker(&build_info, &state.scheduler).await;
@@ -1025,31 +1084,41 @@ async fn handle_immediate_task_dispatch(
         created_at: Instant::now(),
     };
 
-    // Use the model's insert_build method for direct insertion.
-    if builds::Entity::find_by_id(build_id)
-        .one(&state.conn)
-        .await
-        .ok()
-        .flatten()
-        .is_none()
-        && let Err(err) = crate::model::builds::Model::insert_build(
-            build_id,
-            task_id,
-            target_model.id,
-            repo.to_string(),
-            &state.conn,
-        )
-        .await
+    if let Err(err) = crate::model::build_records::ensure_orion_task_record(
+        &state.conn,
+        task_id,
+        cl_link,
+        repo,
+        &changes,
+    )
+    .await
     {
-        tracing::error!("Failed to insert builds into DB: {}", err);
+        tracing::error!("Failed to persist orion task record into DB: {}", err);
         return OrionBuildResult {
             build_id: build_id.to_string(),
             status: "error".to_string(),
-            message: format!("Failed to insert builds into database: {}", err),
+            message: format!("Failed to persist orion task record into database: {}", err),
+        };
+    }
+
+    if let Err(err) = crate::model::build_records::ensure_build_records(
+        &state.conn,
+        build_id,
+        task_id,
+        target_model.id,
+        repo,
+    )
+    .await
+    {
+        tracing::error!("Failed to persist build records into DB: {}", err);
+        return OrionBuildResult {
+            build_id: build_id.to_string(),
+            status: "error".to_string(),
+            message: format!("Failed to persist build records into database: {}", err),
         };
     }
     tracing::info!(
-        "Created build record in DB with ID {} for task {}",
+        "Created build records in DB with ID {} for task {}",
         build_id,
         task_id
     );
@@ -1335,6 +1404,7 @@ async fn process_message(
                     success,
                     exit_code,
                     message,
+                    outcome,
                 } => {
                     state.scheduler.clear_lease(&build_id);
 
@@ -1369,10 +1439,16 @@ async fn process_message(
                         return ControlFlow::Continue(());
                     };
 
-                    // Judge auto retry by exit code
-                    auto_retry_judger.judge_by_exit_code(exit_code.unwrap_or(0));
+                    let is_skipped_no_targets =
+                        matches!(outcome, Some(BuildOutcome::SkippedNoTargets));
 
-                    let can_auto_retry = auto_retry_judger.get_can_auto_retry();
+                    // Judge auto retry by exit code.
+                    if !is_skipped_no_targets {
+                        auto_retry_judger.judge_by_exit_code(exit_code.unwrap_or(0));
+                    }
+
+                    let can_auto_retry =
+                        !is_skipped_no_targets && auto_retry_judger.get_can_auto_retry();
 
                     if can_auto_retry && retry_count < RETRY_COUNT_MAX {
                         tracing::info!(
@@ -1458,7 +1534,9 @@ async fn process_message(
 
                     // Update database with final state
                     let end_at = Utc::now().with_timezone(&FixedOffset::east_opt(0).unwrap());
-                    // TODO: update to jupiter's build_event's model
+                    let build_uuid = build_id.parse::<uuid::Uuid>().unwrap();
+                    let completion_log = Some(message.clone());
+
                     let _ = builds::Entity::update_many()
                         .set(builds::ActiveModel {
                             exit_code: Set(exit_code),
@@ -1466,16 +1544,32 @@ async fn process_message(
                             retry_count: Set(retry_count),
                             ..Default::default()
                         })
-                        .filter(builds::Column::Id.eq(build_id.parse::<uuid::Uuid>().unwrap()))
+                        .filter(builds::Column::Id.eq(build_uuid))
+                        .exec(&state.conn)
+                        .await;
+
+                    let _ = callisto::build_events::Entity::update_many()
+                        .set(callisto::build_events::ActiveModel {
+                            exit_code: Set(exit_code),
+                            end_at: Set(Some(end_at)),
+                            retry_count: Set(retry_count),
+                            log: Set(completion_log.clone()),
+                            ..Default::default()
+                        })
+                        .filter(callisto::build_events::Column::Id.eq(build_uuid))
                         .exec(&state.conn)
                         .await;
 
                     // Update target state
                     let target_uuid = target_id.to_string().parse::<Uuid>().ok();
-                    let target_state = match (success, exit_code) {
-                        (true, Some(0)) => TargetState::Completed,
-                        (_, None) => TargetState::Interrupted,
-                        _ => TargetState::Failed,
+                    let target_state = if is_skipped_no_targets {
+                        TargetState::Completed
+                    } else {
+                        match (success, exit_code) {
+                            (true, Some(0)) => TargetState::Completed,
+                            (_, None) => TargetState::Interrupted,
+                            _ => TargetState::Failed,
+                        }
                     };
                     let mut error_summary = None;
                     if matches!(target_state, TargetState::Failed) {
@@ -2095,8 +2189,6 @@ pub async fn build_retry_handler(
     State(state): State<AppState>,
     Json(req): Json<RetryBuildRequest>,
 ) -> impl IntoResponse {
-    let db = &state.conn;
-
     let build_id = match req.build_id.parse::<uuid::Uuid>() {
         Ok(uuid) => uuid,
         Err(_) => {
@@ -2107,6 +2199,25 @@ pub async fn build_retry_handler(
                 .into_response();
         }
     };
+
+    let build_id_str = build_id.to_string();
+    let submission_lock = state.build_submission_lock(&build_id_str);
+    let submission_guard = submission_lock.lock().await;
+
+    let response = build_retry_handler_inner(state.clone(), req, build_id).await;
+
+    drop(submission_guard);
+    state.cleanup_build_submission_lock(&build_id_str, &submission_lock);
+
+    response
+}
+
+async fn build_retry_handler_inner(
+    state: AppState,
+    req: RetryBuildRequest,
+    build_id: Uuid,
+) -> Response {
+    let db = &state.conn;
 
     if state.scheduler.active_builds.contains_key(&req.build_id) {
         return (
@@ -2270,6 +2381,32 @@ async fn immediate_work(
         created_at: Instant::now(),
     };
 
+    if let Err(err) = crate::model::build_records::ensure_orion_task_record(
+        &state.conn,
+        build.task_id,
+        &req.cl_link,
+        &build.repo,
+        &req.changes,
+    )
+    .await
+    {
+        tracing::error!("Failed to persist retry orion task record into DB: {}", err);
+        return false;
+    }
+
+    if let Err(err) = crate::model::build_records::ensure_build_records(
+        &state.conn,
+        build_id,
+        build.task_id,
+        target.id,
+        &build.repo,
+    )
+    .await
+    {
+        tracing::error!("Failed to persist retry build records into DB: {}", err);
+        return false;
+    }
+
     // Send build to worker
     let msg = WSMessage::TaskBuild {
         build_id: build.id.to_string(),
@@ -2340,7 +2477,38 @@ pub enum BuildEventState {
     Pending,
     Running,
     Success,
+    Skipped,
     Failure,
+}
+
+fn build_event_state_from_fields<T>(
+    end_at: Option<T>,
+    exit_code: Option<i32>,
+    log: Option<&str>,
+) -> BuildEventState {
+    if end_at.is_none() {
+        return BuildEventState::Running;
+    }
+    if matches!(log, Some("Build skipped: no targets")) {
+        return BuildEventState::Skipped;
+    }
+    match exit_code {
+        Some(0) => BuildEventState::Success,
+        Some(_) | None => BuildEventState::Failure,
+    }
+}
+
+fn build_state_from_build_record(
+    build: &builds::Model,
+    log: Option<&str>,
+    is_queued: bool,
+    is_leased: bool,
+) -> BuildEventState {
+    if is_queued || is_leased {
+        return BuildEventState::Pending;
+    }
+
+    build_event_state_from_fields(build.end_at, build.exit_code, log)
 }
 
 #[utoipa::path(
@@ -2596,13 +2764,17 @@ pub async fn build_state_handler(
         )
     })?;
 
-    // First check if the build is currently active (running or pending)
     if state.scheduler.active_builds.contains_key(&build_id) {
         return Ok(Json(BuildEventState::Running));
     }
 
-    // If not active, check the build_events table
-    let build_event = callisto::build_events::Entity::find_by_id(build_uuid)
+    let is_queued = state.scheduler.is_build_queued(build_uuid).await;
+    let is_leased = state.scheduler.is_build_leased(&build_id);
+    if is_queued || is_leased {
+        return Ok(Json(BuildEventState::Pending));
+    }
+
+    if let Some(build_event) = callisto::build_events::Entity::find_by_id(build_uuid)
         .one(&state.conn)
         .await
         .map_err(|e| {
@@ -2614,24 +2786,42 @@ pub async fn build_state_handler(
                 }),
             )
         })?
-        .ok_or_else(|| {
+    {
+        let state_enum = build_event_state_from_fields(
+            build_event.end_at,
+            build_event.exit_code,
+            build_event.log.as_deref(),
+        );
+        return Ok(Json(state_enum));
+    }
+
+    if let Some(build) = builds::Entity::find_by_id(build_uuid)
+        .one(&state.conn)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to fetch build {}: {}", build_id, e);
             (
-                StatusCode::NOT_FOUND,
+                StatusCode::INTERNAL_SERVER_ERROR,
                 Json(MessageResponse {
-                    message: "Build not found".to_string(),
+                    message: "Database error".to_string(),
                 }),
             )
-        })?;
+        })?
+    {
+        return Ok(Json(build_state_from_build_record(
+            &build,
+            None,
+            is_queued,
+            is_leased,
+        )));
+    }
 
-    // Determine state based on build event fields
-    let state_enum = match (build_event.end_at, build_event.exit_code) {
-        (None, _) => BuildEventState::Running, // Still running but not in active_builds (shouldn't happen)
-        (Some(_), Some(0)) => BuildEventState::Success,
-        (Some(_), Some(_)) => BuildEventState::Failure,
-        (Some(_), None) => BuildEventState::Failure, // Interrupted case
-    };
-
-    Ok(Json(state_enum))
+    Err((
+        StatusCode::NOT_FOUND,
+        Json(MessageResponse {
+            message: "Build not found".to_string(),
+        }),
+    ))
 }
 
 /// Get latest build result by task ID
@@ -2657,7 +2847,6 @@ pub async fn latest_build_result_handler(
         )
     })?;
 
-    // Verify task exists
     let task_exists = callisto::orion_tasks::Entity::find_by_id(task_uuid)
         .one(&state.conn)
         .await
@@ -2670,7 +2859,20 @@ pub async fn latest_build_result_handler(
                 }),
             )
         })?
-        .is_some();
+        .is_some()
+        || tasks::Entity::find_by_id(task_uuid)
+            .one(&state.conn)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to verify legacy task existence {}: {}", task_id, e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(MessageResponse {
+                        message: "Database error".to_string(),
+                    }),
+                )
+            })?
+            .is_some();
 
     if !task_exists {
         return Err((
@@ -2681,7 +2883,6 @@ pub async fn latest_build_result_handler(
         ));
     }
 
-    // Find latest build event for this task
     let latest_build_event = callisto::build_events::Entity::find()
         .filter(callisto::build_events::Column::TaskId.eq(task_uuid))
         .order_by_desc(callisto::build_events::Column::StartAt)
@@ -2701,8 +2902,32 @@ pub async fn latest_build_result_handler(
             )
         })?;
 
-    let build_event = match latest_build_event {
-        Some(event) => event,
+    if let Some(build_event) = latest_build_event {
+        let state_enum = build_event_state_from_fields(
+            build_event.end_at,
+            build_event.exit_code,
+            build_event.log.as_deref(),
+        );
+        return Ok(Json(state_enum));
+    }
+
+    let latest_build = builds::Entity::find()
+        .filter(builds::Column::TaskId.eq(task_uuid))
+        .order_by_desc(builds::Column::StartAt)
+        .one(&state.conn)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to fetch legacy build for task {}: {}", task_id, e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(MessageResponse {
+                    message: "Database error".to_string(),
+                }),
+            )
+        })?;
+
+    let build = match latest_build {
+        Some(build) => build,
         None => {
             return Err((
                 StatusCode::NOT_FOUND,
@@ -2713,15 +2938,12 @@ pub async fn latest_build_result_handler(
         }
     };
 
-    // Determine state based on build event fields
-    let state_enum = match (build_event.end_at, build_event.exit_code) {
-        (None, _) => BuildEventState::Running,
-        (Some(_), Some(0)) => BuildEventState::Success,
-        (Some(_), Some(_)) => BuildEventState::Failure,
-        (Some(_), None) => BuildEventState::Failure, // Interrupted case
-    };
-
-    Ok(Json(state_enum))
+    Ok(Json(build_state_from_build_record(
+        &build,
+        None,
+        state.scheduler.is_build_queued(build.id).await,
+        state.scheduler.is_build_leased(&build.id.to_string()),
+    )))
 }
 
 #[derive(Hash, Eq, PartialEq, Clone)]
@@ -2998,6 +3220,10 @@ pub async fn single_target_status_handle(
 
 #[cfg(test)]
 mod tests {
+    use super::{BuildEventState, build_event_state_from_fields, build_state_from_build_record};
+    use crate::model::builds;
+    use chrono::{FixedOffset, Utc};
+
     /// Test random number generation for worker selection
     #[test]
     fn test_rng() {
@@ -3007,5 +3233,40 @@ mod tests {
         let mut rng = rand::rng();
         println!("{:?}", choices.choose(&mut rng));
         println!("{:?}", choices.choose(&mut rng));
+    }
+
+    #[test]
+    fn test_build_event_state_from_fields_detects_skipped_no_targets() {
+        let end_at = Some(Utc::now().with_timezone(&FixedOffset::east_opt(0).unwrap()));
+        let state =
+            build_event_state_from_fields(end_at, Some(0), Some("Build skipped: no targets"));
+        assert!(matches!(state, BuildEventState::Skipped));
+    }
+
+    #[test]
+    fn test_build_event_state_from_fields_detects_success() {
+        let end_at = Some(Utc::now().with_timezone(&FixedOffset::east_opt(0).unwrap()));
+        let state = build_event_state_from_fields(end_at, Some(0), Some("Build succeeded"));
+        assert!(matches!(state, BuildEventState::Success));
+    }
+
+    #[test]
+    fn test_build_state_from_build_record_detects_pending_queue_state() {
+        let build = builds::Model {
+            id: uuid::Uuid::nil(),
+            task_id: uuid::Uuid::nil(),
+            target_id: uuid::Uuid::nil(),
+            exit_code: None,
+            start_at: Utc::now().into(),
+            end_at: None,
+            repo: "/".to_string(),
+            args: None,
+            output_file: String::new(),
+            created_at: Utc::now().into(),
+            retry_count: 0,
+        };
+
+        let state = build_state_from_build_record(&build, None, true, false);
+        assert!(matches!(state, BuildEventState::Pending));
     }
 }

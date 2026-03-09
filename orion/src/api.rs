@@ -1,4 +1,8 @@
-use api_model::buck2::{status::Status, types::ProjectRelativePath, ws::WSMessage};
+use api_model::buck2::{
+    status::Status,
+    types::{BuildOutcome, ProjectRelativePath},
+    ws::WSMessage,
+};
 use serde::Serialize;
 use tokio::sync::mpsc::UnboundedSender;
 use uuid::Uuid;
@@ -17,6 +21,9 @@ pub struct BuildResult {
     pub exit_code: Option<i32>,
     /// Human-readable status or error message
     pub message: String,
+    /// Optional semantic outcome for successful non-build completions
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<BuildOutcome>,
 }
 
 /// Executes a buck build and reports completion via WebSocket.
@@ -46,26 +53,20 @@ pub async fn buck_build(
     )
     .await
     {
-        Ok(status) => {
-            let message = format!(
-                "Build {}",
-                if status.success() {
-                    "succeeded"
-                } else {
-                    "failed"
-                }
-            );
+        Ok(result) => {
             tracing::info!(
-                "[Task {}] {}; Exit code: {:?}",
+                "[Task {}] {}; Exit code: {:?}; outcome: {:?}",
                 id_str,
-                message,
-                status.code()
+                result.message,
+                result.exit_code,
+                result.outcome
             );
             BuildResult {
-                success: status.success(),
+                success: result.success,
                 build_id: id_str.clone(),
-                exit_code: status.code(),
-                message,
+                exit_code: result.exit_code,
+                message: result.message,
+                outcome: result.outcome,
             }
         }
         Err(e) => {
@@ -76,6 +77,7 @@ pub async fn buck_build(
                 build_id: id_str.clone(),
                 exit_code: None,
                 message: error_msg,
+                outcome: None,
             }
         }
     };
@@ -85,6 +87,7 @@ pub async fn buck_build(
         success: build_result.success,
         exit_code: build_result.exit_code,
         message: build_result.message.clone(),
+        outcome: build_result.outcome.clone(),
     };
 
     if sender.send(complete_msg).is_err() {

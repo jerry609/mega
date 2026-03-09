@@ -12,6 +12,8 @@ static MANAGER: OnceCell<Arc<AntaresManager>> = OnceCell::const_new();
 
 type DynError = Box<dyn Error + Send + Sync>;
 
+const BUCK_REPO_READY_PATH: &str = ".buckconfig";
+
 /// Get the global AntaresManager instance.
 ///
 /// Initializes the manager on first call by loading the scorpio configuration
@@ -111,11 +113,20 @@ fn resolve_config_path() -> Result<PathBuf, DynError> {
 ///
 /// # Returns
 /// The `AntaresConfig` containing mountpoint and job metadata on success.
-pub async fn mount_job(job_id: &str, cl: Option<&str>) -> Result<AntaresConfig, DynError> {
-    tracing::debug!("Mounting Antares job: job_id={}, cl={:?}", job_id, cl);
+pub async fn mount_job(
+    job_id: &str,
+    repo_path: &str,
+    cl: Option<&str>,
+) -> Result<AntaresConfig, DynError> {
+    tracing::debug!(
+        "Mounting Antares job: job_id={}, repo_path={}, cl={:?}",
+        job_id,
+        repo_path,
+        cl
+    );
     get_manager()
         .await?
-        .mount_job(job_id, cl)
+        .mount_job_for_path_with_ready_path(job_id, repo_path, cl, Some(BUCK_REPO_READY_PATH))
         .await
         .map_err(Into::into)
 }

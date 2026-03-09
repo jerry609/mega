@@ -12,6 +12,13 @@ pub enum TaskPhase {
     RunningBuild,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BuildOutcome {
+    Built,
+    SkippedNoTargets,
+}
+
 #[derive(Clone, Debug, Hash, PartialEq, Eq, Display, Deserialize, Serialize, ToSchema)]
 pub struct ProjectRelativePath(String);
 

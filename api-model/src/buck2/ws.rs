@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::buck2::{
     status::Status,
-    types::{ProjectRelativePath, TaskPhase},
+    types::{BuildOutcome, ProjectRelativePath, TaskPhase},
 };
 
 /// Message protocol for WebSocket communication between worker and server.
@@ -58,6 +58,8 @@ pub enum WSMessage {
         success: bool,
         exit_code: Option<i32>,
         message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        outcome: Option<BuildOutcome>,
     },
     /// Batch of target build status updates for real-time build progress tracking.
     TargetBuildStatusBatch {
