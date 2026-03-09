@@ -32,7 +32,6 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-// Import complete Error trait for better error handling
 use crate::repo::changes::Changes;
 use crate::repo::diff;
 
@@ -42,10 +41,6 @@ const MOUNT_READY_TIMEOUT_SECS: u64 = 15;
 const MOUNT_READY_POLL_INTERVAL_MS: u64 = 200;
 const MOUNT_READY_SINGLE_PROBE_TIMEOUT_SECS: u64 = 2;
 const LOCAL_BUCK_OUT_ROOT: &str = "/tmp/orion-buck-out";
-
-#[allow(dead_code)]
-static PROJECT_ROOT: Lazy<String> =
-    Lazy::new(|| std::env::var("BUCK_PROJECT_ROOT").expect("BUCK_PROJECT_ROOT must be set"));
 
 const DEFAULT_PREHEAT_SHALLOW_DEPTH: usize = 3;
 static BUILD_CONFIG: Lazy<Option<BuildConfig>> = Lazy::new(load_build_config);
