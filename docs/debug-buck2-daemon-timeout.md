@@ -2985,3 +2985,138 @@ buck_controller.rs 共约 1400 行，核心逻辑包括:
 b6bc0cea docs: explain local buck-out isolation tradeoffs  (之前)
 5d4bfaeb fix(orion): correct --event-log flag placement and clippy warning  (本次)
 ```
+
+
+---
+
+## Part 9: 全面检查、死代码清理与三层问题定位 (2026-03-09)
+
+### 1) 出发点
+
+用户在真实 worker 回归时又撞到：
+
+```
+Error getting build targets: Fail to get cells: Transport endpoint is not connected (os error 107)
+```
+
+以及 ignored env test 中出现的 scorpiofs store lock:
+
+```
+/tmp/megadir/store/path.db/db: WouldBlock
+```
+
+因此做一轮全面检查，目标是：
+- 确认 os error 107 的处理是否到位
+- 清理死代码，保持实现干净
+- 定位三层问题的当前状态
+
+### 2) 三层问题定位
+
+#### L1: 挂载 ready 窗口问题 (os error 107)
+
+报错链路:
+```
+build() -> get_build_targets() -> buck2.cells()
+  -> "Fail to get cells: Transport endpoint is not connected (os error 107)"
+```
+
+当前防御机制:
+- `wait_for_repo_mount_ready()` 在 mount 后轮询 15s，确认 FUSE 可达
+- `is_retryable_target_discovery_error()` 识别 "Transport endpoint is not connected" 和 "os error 107"
+- `build()` 中 `MAX_TARGETS_ATTEMPTS = 3`，遇到 retryable 错误时卸载旧 mount，重新挂载
+
+分析: 防御机制已经到位。os error 107 发生在 `wait_for_repo_mount_ready` 通过之后、`buck2.cells()` 执行期间，说明 FUSE 连接在 ready 检查和实际使用之间断开。这属于 FUSE 层的瞬态故障，retry 是正确的应对方式。
+
+结论: 代码层面已正确处理。如果仍然频繁出现，需要从 scorpiofs/dicfuse 层排查连接稳定性。
+
+#### L2: buck-out 在 FUSE upper layer 的 Buck2 锁问题
+
+已在之前的 commit (becb68b4) 中修复:
+- buck-out 通过 symlink 指向 `/tmp/orion-buck-out/buck-out-<hash>`
+- Buck2 daemon/materializer state 写入 host-local FS
+- advisory lock 不再经过 FUSE
+
+结论: 已修复。
+
+#### L3: Scorpio 自身 store/path.db 的锁竞争问题
+
+实际检查发现:
+- path.db 锁当前持有者: PID 2426837 (`target/debug/orion`)
+- 4 个 zombie scorpio 进程 (PPID=1, Feb 25 创建)
+- state.toml 引用 3 个已不存在的挂载目录
+- 14 个 orphan upper dirs
+
+`WouldBlock` 的根因: 多个进程(或同一进程的多次初始化)竞争打开同一个 rocksdb/sled 数据库文件。这在以下场景会发生:
+- 并发跑 ignored env test 时，多个 mount 操作竞争 scorpiofs 的内部 store
+- orion 异常退出后未释放 db lock，新启动时碰到旧锁
+
+结论: 这不是 orion 代码层面能修的，是 scorpiofs 的 store 层问题。当前 orion 能做的是避免并发打开、确保 graceful shutdown。
+
+### 3) 死代码清理
+
+#### 删除的代码
+
+| 文件 | 内容 | 行数 | 原因 |
+|------|------|------|------|
+| buck_controller.rs:46-48 | `PROJECT_ROOT` static | -3 | `#[allow(dead_code)]`，项目内零引用 |
+| buck_controller.rs:35 | 误导性注释 | -1 | "Import complete Error trait" 无实际意义 |
+| util.rs (整个文件) | `ensure_created`, `ensure_file_content`, `ensure_parent_dirs` | -27 | 全部 `#[allow(dead_code)]`，项目内零引用 |
+| lib.rs:5 | `mod util;` | -1 | 模块无使用者 |
+| main.rs:6 | `mod util;` | -1 | 同上 |
+
+总计: 4 个文件，净删除 34 行
+
+#### 验证
+
+- `cargo check -p orion`: 通过，0 errors
+- `cargo clippy -p orion -- -W clippy::all`: 通过，0 warnings
+- `cargo test -p orion`: 39 passed, 0 failed, 1 ignored
+
+### 4) 服务器残留清理
+
+| 操作 | 详情 |
+|------|------|
+| state.toml 清空 | 移除 3 个引用已不存在目录的 stale 挂载记录 |
+| orphan upper dirs | 清理 14 个 `/tmp/megadir/antares/upper/` 下的孤儿目录 |
+| zombie scorpio | 4 个 `<defunct>` 进程，PPID=1 (init)，无法 kill，等系统 reap |
+
+### 5) 代码现状总结
+
+清理后 orion/src/ 的文件结构:
+
+```
+orion/src/
+  antares.rs   - Antares FS 管理 (scorpiofs wrapper)
+  api.rs       - Build API 入口
+  buck_controller.rs - 核心构建控制 (~1390 行)
+  lib.rs       - 模块声明 (4 个模块)
+  main.rs      - 入口点
+  repo/        - repo diff/changes 逻辑
+  ws.rs        - WebSocket 客户端
+```
+
+无 `#[allow(dead_code)]`，无 clippy warnings，无 unused imports。
+
+### 6) 更新后的问题总表
+
+| # | 问题 | 层 | 状态 | 备注 |
+|---|------|-----|------|------|
+| 1 | 挂载返回后 FUSE 未 ready (ENOTCONN/ESTALE) | L1 | 已修复 | wait_for_repo_mount_ready + 3次 retry |
+| 2 | 跳过 unmount 导致脏挂载积累 | L1 | 已修复 | 恢复 unmount + MountGuard RAII |
+| 3 | build 早返回路径未统一回收 | L1 | 已修复 | 统一 cleanup 路径 |
+| 4 | ignored test 用同步阻塞命令 | - | 已修复 | 改为 tokio async |
+| 5 | Buck2 daemon state 落在 FUSE buck-out | L2 | 已修复 | host-local buck-out 隔离 |
+| 6 | --event-log 参数位置错误 | L2 | 已修复 | 提取 helper + 测试 |
+| 7 | 死代码 (PROJECT_ROOT, util.rs) | - | 已修复 | 本次删除 34 行 |
+| 8 | worker 异常退出后 buck-out 残留 | L2 | 部分修复 | 正常路径已清理; 异常路径建议补 GC |
+| 9 | Orphan buck2 daemons 在 FUSE 不可用时无法清理 | L2 | 已知 | 建议记录 PID 做 fallback kill |
+| 10 | Scorpio path.db WouldBlock 锁竞争 | L3 | 已知 | scorpiofs 层问题，非 orion 能修 |
+| 11 | Zombie scorpio 进程 | L3 | 已知 | PPID=1, 等 init reap |
+| 12 | e2e 测试 teardown 不完整 | L3 | 已知 | 需要 scorpiofs 侧改进 |
+| 13 | state.toml 与实际挂载不同步 | L3 | 已手动清理 | 需要 antares manager 侧改进 |
+
+### 7) 本次提交
+
+```
+90bb42f1 refactor(orion): remove dead code
+```
