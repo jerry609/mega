@@ -3957,3 +3957,104 @@ if needs_lazy {
 - 之前 target discovery 阶段的 `os error 107` 没有再出现；
 - 没有引入新的 mount-ready 回归；
 - 没有重新刷出那条 4096 对齐 warning。
+
+## 2026-03-10 新一轮回归与定位（worker-scoped Dicfuse store）
+
+### 本轮修复
+
+1. `orion/src/antares.rs`
+   - 将 Scorpio 运行时状态改成按 worker 隔离：`/tmp/megadir/store/orion-workers/<worker_id>`。
+   - 将 Antares state 文件改成按 worker 隔离：`/tmp/megadir/antares/state-<worker_id>.toml`。
+   - 将 `SCORPIO_CONFIG` 初始化改成「同进程内已初始化则复用」，避免首轮初始化中途失败后，后续请求只暴露 `Configuration already initialized` 这个二次症状。
+2. `scorpiofs/src/antares/mod.rs`
+   - `AntaresManager` 显式携带 `store_root`，保证根挂载和子路径挂载都落到同一个 worker-scoped store root，而不是根挂载用隔离 store、子路径又退回全局 `/tmp/megadir/store`。
+   - `new_with_store_path()` 改为走 `DicfuseManager::for_base_path_with_store_root("/", store_root)`，确保自定义 store root 也会触发 `import_arc`，不会卡在 `wait_for_path_ready()` 之前。
+
+### 已确认修掉的问题
+
+- `could not acquire lock on "/tmp/megadir/store/path.db/db"` 不再复现。
+- `Configuration already initialized` 不再复现。
+- `Transport endpoint is not connected` / `os error 107` 在本轮 smoke 与压力回归里都没有再出现。
+- `Timed out waiting for mounted repo path ...` 在本轮回归里没有再出现。
+- `rfuse3::raw::session: The data is not 4096 bytes aligned` 在本轮日志中没有再出现。
+
+### smoke 验证（单 worker）
+
+- worker：`smoke-worker-1`
+- build_id：`20d13116-7a77-44a1-bcef-7763ea8650de`
+- 关键链路：
+  - `mount_job_at start` -> `Mount spawned` -> `Filesystem mounted successfully` -> `Get cells at` 全部走通。
+  - Dicfuse root 预热日志显示：`[load_dir_depth] completed loading directory tree from user="/" in 4.23s`。
+  - 之后进入 Buck2 target discovery / preheat / build diff 阶段，最终 `/v2/build-state/<build_id>` 收敛到 `Skipped`。
+- 结论：worker-scoped store 的链路已经不是“挂载前卡死”或“FUSE/锁立即报错”，而是能够稳定进入 Buck2 discovery。
+
+### 4 worker / 20 task 压力回归结果
+
+- worker：`stress4-worker-1..4`
+- 请求：连续 `POST /task` 20 次
+- 截止主动终止压测前的状态快照：
+  - `Skipped`: 4
+  - `Failure`: 4
+  - `Running`: 12
+- 本轮统计：
+  - `Transport endpoint is not connected` = 0
+  - `os error 107` = 0
+  - `Timed out waiting for mounted repo path` = 0
+  - `disk I/O error` = 0
+  - `advisory file locking layer` = 0
+  - `could not acquire lock` = 0
+  - `Configuration already initialized` = 0
+  - `establishing connection to Buck daemon or start a daemon timed out after 90.000s` = 20
+  - `Error getting build targets` = 15
+
+### 新的主要瓶颈：Buck2 daemon connect timeout
+
+当前新的主问题已经不是 FUSE ENOTCONN / sled 锁冲突，而是：
+
+- 多 worker 并发进入 `Get cells` 时，`buck2 audit cell --reuse-current-config` 对应的 daemon startup / connect 在 90s 内没有完成；
+- 失败会落成：`Error getting build targets: Fail to get cells: Buck2 stderr: Command failed: Failed to connect to buck daemon`；
+- 日志里可以看到 daemon 已经 `Listening.`，但 client 侧仍在 90s deadline 内没有完成连接，随后被判定超时；
+- 说明当前瓶颈已经从“FUSE ready/锁文件层错误”转移到“Buck2 daemon 在并发冷启动场景下的启动/连接/复用策略”。
+
+换句话说：
+
+- ENOTCONN 这一条链路当前没有再复现；
+- worker-scoped store 修复的是「Scorpiofs/Dicfuse 多进程共享同一个 sled store 导致的锁冲突」；
+- 剩下要继续攻克的是「Buck2 daemon 在多 worker 并发冷启动时的连接超时」。
+
+### 对当前现象的判断
+
+- 之前 `Configuration already initialized` 只是二次症状，不是根因；真正根因是多个 worker 进程同时打开全局 `/tmp/megadir/store/path.db`，导致 sled advisory lock 抢占失败，初始化中途 panic。
+- 把 Dicfuse store 改成 worker-scoped 之后，这个根因已经消失。
+- 但因为每个 worker 现在都是自己的冷 store + 自己的新 mount + 自己的新 Buck2 daemon，系统在 4 worker 并发下转而暴露出 Buck2 daemon connect timeout。
+- 这说明当前下一步优化重点应从 `Scorpiofs ready / store lock` 切到 `Buck2 daemon reuse / startup concurrency / isolation strategy`。
+
+### Dicfuse 性能热点（代码级定位）
+
+本轮结合代码分析，当前 Dicfuse / target discovery 的热点主要有：
+
+1. `wait_for_path_ready()` + `ensure_dir_loaded()`
+   - 首次访问未加载目录时会串行触发目录级远端拉取；Buck2 深路径遍历会形成 ancestor-by-ancestor 的 RTT waterfall。
+2. `radix_trie: Mutex<Trie<...>>`
+   - `get_inode_from_path()` / `get_by_path()` 路径查找全都竞争同一个全局 trie 锁；并发 metadata storm 下会形成热点。
+3. `inode_to_user_path()` / `get_all_path()`
+   - 频繁通过 `path.db` 逐级回溯重建路径， sibling-heavy lookup 时会重复做 sled 读和字符串拼接。
+4. `insert_item()` / `update_inode()`
+   - 导入大目录时会对 parent `children` 做反复读改写，造成明显的 sled write amplification。
+5. `load_dir_depth()`
+   - Antares 默认仍会做深度预热（当前默认 `antares_load_dir_depth=3`，内部实际会把 BFS 再向下扩几层），会和 Buck2 的实时 metadata 扫描争抢带宽与锁。
+6. `get_dir_hash()` / `load_dir()`
+   - refresh 路径对目录树会做大量 `dir-hash` RPC；即使目录没变，也可能递归走很多子目录。
+7. `getattr_with_mapping()` -> `get_or_fetch_file_size()`
+   - 某些冷路径上的 stat 仍会触发额外 size probe，对于 Buck2 的 metadata scan 不够友好。
+
+### 下一步建议（按优先级）
+
+1. 继续处理 Buck2 daemon timeout：
+   - 重点看 `Get cells` 阶段是否要改成更稳定的 daemon reuse 策略，而不是每个 fresh mount 都冷启动一个新 daemon；
+   - 同时评估 `--isolation-dir` / worker 级运行目录策略是否还能进一步稳定化。
+2. 如果继续保留 direct-call Antares 模式，建议把「worker-scoped store」保留，但不要再回退到全局共享 sled store。
+3. Dicfuse 层后续如果要继续做性能优化，优先看：
+   - trie/path 级缓存与锁粒度；
+   - 目录导入的批量写入；
+   - 预热深度与 target discovery 的资源竞争。
