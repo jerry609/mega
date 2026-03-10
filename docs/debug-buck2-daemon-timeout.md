@@ -4058,3 +4058,97 @@ if needs_lazy {
    - trie/path 级缓存与锁粒度；
    - 目录导入的批量写入；
    - 预热深度与 target discovery 的资源竞争。
+
+## 2026-03-10 daemon reuse / isolation 重构后的真实回归
+
+### 本轮代码调整
+
+1. `orion/src/antares.rs`
+   - 直接调用 Antares 时，不再为每个 task 生成一次性 mount UUID 路径，而是改成 **worker-scoped stable mount slot**。
+   - mountpoint 现在按 `worker_id + repo_scope + role(old/new)` 固定下来；这样同一 worker 的 old/new 视图会复用稳定挂载槽位，不再把 Buck2 runtime 绑到一次性 mount path 上。
+2. `orion/src/buck_controller.rs`
+   - 新增 `BuckRuntime`，把 `project_root / isolation_dir / local buck-out` 作为一个运行时单元管理。
+   - `buck2_isolation_dir()` 继续按挂载根路径 hash，但由于挂载根现在是稳定槽位，所以 `--isolation-dir` 也稳定下来。
+   - 成功路径上不再在 `cells -> targets -> build` 每个阶段后立刻 `buck2 kill`。
+   - 成功路径上也不再删除本地 `buck-out` 目录；只在 setup 失败或显式 reset 时做 `reset_buck2_runtime()`。
+   - 也就是说，这一轮不是继续加 retry 补丁，而是把“Buck2 runtime 生命周期”从“每阶段一次性用完即删”重构成“worker 槽位级复用，失败时再 reset”。
+
+### 回归前额外踩到的环境问题（已处理）
+
+这轮真实回归里还暴露了几类**环境依赖问题**，这里一并记录，避免后面误判成 Orion/Buck2 回归：
+
+1. `http://localhost:8000` 不可用
+   - 直接表现为 `Timed out waiting for path "/.buckconfig" to become ready: Failed to fetch tree ... http://localhost:8000/...`。
+   - 说明这不是 Buck2 daemon timeout，而是本地 Mega HTTP 服务没起来，Dicfuse 根本拿不到 tree 数据。
+2. `mono` 本地服务依赖没准备好
+   - 为了恢复 `localhost:8000`，本轮补齐了本地联调依赖：
+     - 编译 `mono` release；
+     - 创建 PostgreSQL `mono` 用户 / 数据库；
+     - 安装并启动 `redis-server`。
+3. Vault core key 与当前存储不一致
+   - `mono` 启动时一度报 `Unseal error: Some(ErrBarrierNotInit)`。
+   - 根因是旧的 `/root/.local/share/mega/vault/core_key.json` 仍在，但当前 vault 存储已经不是与之匹配的那份状态。
+   - 处理方式是先备份旧 `core_key.json`，让服务按当前存储重新初始化并生成新的 key 文件。
+
+这些问题处理完以后，`mono service http` 才真正把 `127.0.0.1:8000` 拉起来，Orion/Scorpiofs 的真实链路才能继续验证。
+
+### 真实回归结果
+
+#### 1. 4 worker / 20 task + worker 重启注入
+
+- worker：`stress4-worker-1..4`
+- 请求：连续 `POST /task` 20 次
+- 中途注入：
+  - kill `stress4-worker-4`（旧 PID `2591910`）
+  - 约 10s 后重启，新的 PID `2593944`
+- 最终结果：
+  - `Skipped`: 20
+  - `Failure`: 0
+  - `Running`: 0
+- 说明：
+  - 队列里的任务没有因为 worker 重启而丢失；
+  - 也没有出现“前一轮 worker 已拿到任务、重启后又重复执行一遍”的明显重复消费现象。
+
+#### 2. duplicate trigger（同一 build_id 并发重复提交）
+
+- 同一个 `build_id=047a08f4-b328-493a-aedf-e8473537ed0f` 并发提交 5 次。
+- 返回结果：
+  - 1 次返回 `dispatched`
+  - 4 次返回 `building / Build is already running`
+  - 5 次响应里的 `task_id` 全部相同：`019cd6ec-3f54-74c2-8be7-c3a7b680fa65`
+- worker 日志里 `Received task: id=047a08f4-b328-493a-aedf-e8473537ed0f` 只出现 **1 次**。
+- 说明当前幂等/并发冲突治理在这条链路上是生效的：同一个 build_id 并发触发时，只会有 1 次真实执行，其余请求复用同一任务状态。
+
+#### 3. retry build
+
+- 对 `build_id=bc1ba70c-243e-429e-b434-324e6736f7cf` 执行 `POST /retry-build`。
+- 接口返回：`Build retry dispatched immediately to worker`
+- 同一个 build_id 的 worker dispatch 计数从 `1` 增长到 `2`。
+- 最终状态仍收敛到 `Skipped`。
+- 说明 retry build 在当前链路上确实重新派发了一次，而不是被“老状态短路掉”。
+
+### 这轮最关键的结论
+
+在这轮 **真实 worker 链路 + 本地 mono/scorpiofs 依赖已拉起** 的回归里，下面这些问题都没有再出现：
+
+- `Transport endpoint is not connected`
+- `os error 107`
+- `Timed out waiting for mounted repo path`
+- `Failed to connect to buck daemon`
+- `establishing connection to Buck daemon or start a daemon timed out after 90.000s`
+- `disk I/O error`
+- `I/O error in the advisory file locking layer`
+- `could not acquire lock`
+- `Configuration already initialized`
+
+也就是说，这次 daemon reuse / isolation 重构之后：
+
+- 之前那条 `Error getting build targets: Fail to get cells: Failed to connect to buck daemon` 的链路，本轮没有再复现；
+- 之前 `ENOTCONN / os error 107` 这条链路，本轮也没有回归；
+- worker 重启、duplicate trigger、retry build 三条回归链路都能正常收敛。
+
+### 当前判断
+
+- 这轮改动没有改外部契约，主要是把内部运行时从“task 级一次性 Buck2 runtime”重构成“worker 槽位级稳定 runtime + 失败时 reset”。
+- 目前回归结果说明这个方向是对的：真正压下去的不是某一个报错字符串，而是把导致 daemon 冷启动风暴的生命周期管理方式改掉了。
+- 还没继续做的，是“真实有 target 的大变更 / 更长时间高压 / Dicfuse 性能瓶颈画像”这部分；但至少当前最关键的 Buck2 daemon timeout、ENOTCONN、重复触发/重试/worker 重启三条链路都已经收敛。

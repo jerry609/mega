@@ -5,8 +5,7 @@
 
 use std::{
     error::Error,
-    fs,
-    io,
+    fs, io,
     path::{Path, PathBuf},
     sync::{Arc, OnceLock},
 };
@@ -20,7 +19,7 @@ static SCORPIO_CONFIG_PATH: OnceLock<PathBuf> = OnceLock::new();
 type DynError = Box<dyn Error + Send + Sync>;
 
 const BUCK_REPO_READY_PATH: &str = ".buckconfig";
-const ORION_WORKER_STORE_DIR: &str = "orion-workers";
+const ORION_WORKER_RUNTIME_DIR: &str = "orion-workers";
 
 /// Get the global AntaresManager instance.
 ///
@@ -145,12 +144,14 @@ fn sanitize_path_component(raw: &str) -> String {
 
 fn scoped_store_path(base_store_path: &Path) -> PathBuf {
     base_store_path
-        .join(ORION_WORKER_STORE_DIR)
+        .join(ORION_WORKER_RUNTIME_DIR)
         .join(worker_scope())
 }
 
 fn scoped_state_file(base_state_file: &Path) -> PathBuf {
-    let parent = base_state_file.parent().unwrap_or_else(|| Path::new("/tmp"));
+    let parent = base_state_file
+        .parent()
+        .unwrap_or_else(|| Path::new("/tmp"));
     let stem = base_state_file
         .file_stem()
         .and_then(|value| value.to_str())
@@ -160,6 +161,33 @@ fn scoped_state_file(base_state_file: &Path) -> PathBuf {
         Some(ext) if !ext.is_empty() => parent.join(format!("{stem}-{scope}.{ext}")),
         _ => parent.join(format!("{stem}-{scope}")),
     }
+}
+
+fn normalized_repo_scope(repo_path: &str) -> String {
+    let trimmed = repo_path.trim();
+    if trimmed.is_empty() || trimmed == "/" {
+        return "repo-root".to_string();
+    }
+
+    let digest = ring::digest::digest(&ring::digest::SHA256, trimmed.as_bytes());
+    let suffix = &hex::encode(digest.as_ref())[..12];
+    format!("repo-{suffix}")
+}
+
+fn mount_role(job_id: &str) -> &'static str {
+    if job_id.contains("-old-") {
+        "old"
+    } else {
+        "new"
+    }
+}
+
+fn scoped_mountpoint(repo_path: &str, job_id: &str) -> PathBuf {
+    Path::new(scorpiofs::util::config::antares_mount_root())
+        .join(ORION_WORKER_RUNTIME_DIR)
+        .join(worker_scope())
+        .join(normalized_repo_scope(repo_path))
+        .join(mount_role(job_id))
 }
 
 fn resolve_config_path() -> Result<PathBuf, DynError> {
@@ -227,15 +255,23 @@ pub async fn mount_job(
     repo_path: &str,
     cl: Option<&str>,
 ) -> Result<AntaresConfig, DynError> {
+    let mountpoint = scoped_mountpoint(repo_path, job_id);
     tracing::debug!(
-        "Mounting Antares job: job_id={}, repo_path={}, cl={:?}",
+        "Mounting Antares job: job_id={}, repo_path={}, mountpoint={}, cl={:?}",
         job_id,
         repo_path,
+        mountpoint.display(),
         cl
     );
     get_manager()
         .await?
-        .mount_job_for_path_with_ready_path(job_id, repo_path, cl, Some(BUCK_REPO_READY_PATH))
+        .mount_job_at_for_path_with_ready_path(
+            job_id,
+            mountpoint,
+            repo_path,
+            cl,
+            Some(BUCK_REPO_READY_PATH),
+        )
         .await
         .map_err(Into::into)
 }

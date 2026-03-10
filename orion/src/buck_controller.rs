@@ -53,11 +53,55 @@ pub struct BuildExecution {
     pub outcome: Option<BuildOutcome>,
 }
 
+#[derive(Debug, Clone)]
+struct BuckRuntime {
+    project_root: PathBuf,
+    isolation_dir: String,
+    local_buck_out: PathBuf,
+}
+
+impl BuckRuntime {
+    fn prepare(project_root: impl Into<PathBuf>) -> anyhow::Result<Self> {
+        let project_root = project_root.into();
+        let isolation_dir = buck2_isolation_dir(&project_root)?;
+        let local_buck_out = ensure_local_buck_out(&project_root)?;
+        tracing::info!(
+            repo = ?project_root,
+            isolation_dir = %isolation_dir,
+            local_buck_out = ?local_buck_out,
+            "Prepared buck2 runtime"
+        );
+        Ok(Self {
+            project_root,
+            isolation_dir,
+            local_buck_out,
+        })
+    }
+
+    fn project_root(&self) -> &Path {
+        &self.project_root
+    }
+
+    fn isolation_dir(&self) -> &str {
+        &self.isolation_dir
+    }
+
+    fn reset(&self) {
+        tracing::info!(
+            repo = ?self.project_root,
+            isolation_dir = %self.isolation_dir,
+            local_buck_out = ?self.local_buck_out,
+            "Resetting buck2 runtime"
+        );
+        reset_buck2_runtime(self.project_root());
+    }
+}
+
 struct PreparedBuildAttempt {
-    mount_point: String,
+    new_runtime: BuckRuntime,
+    old_runtime: BuckRuntime,
     mount_guard: MountGuard,
     old_mount_guard: MountGuard,
-    old_project_root: PathBuf,
     targets: Vec<TargetLabel>,
 }
 
@@ -259,43 +303,11 @@ fn resolve_config_path() -> Option<PathBuf> {
     None
 }
 
-/// Derive a stable per-mount buck2 isolation directory name.
+/// Derive a stable Buck2 isolation directory for a mounted worker slot.
 ///
-/// # Why `--isolation-dir` is required
-///
-/// Although we always mount the **same monorepo** (`path = "/"`), every call
-/// to `mount_antares_fs()` goes through `POST /antares/mounts` which creates
-/// a **new UUID** and therefore a **new mountpoint path** each time:
-///
-/// ```text
-///   build task A  →  mount_antares_fs(job="A-1", path="/", cl=None)
-///                     → mountpoint = /var/lib/antares/mounts/<uuid-1>
-///
-///   build task A  →  mount_antares_fs(job="A-1", path="/", cl="CL-42")
-///                     → mountpoint = /var/lib/antares/mounts/<uuid-2>
-///
-///   build task B  →  mount_antares_fs(job="B-1", path="/", cl=None)
-///                     → mountpoint = /var/lib/antares/mounts/<uuid-3>
-/// ```
-///
-/// Without `--isolation-dir`, Buck2 uses a **single default daemon** per
-/// `<project_root>`.  Because the project root changes with every mount UUID,
-/// this usually just causes redundant daemon restarts.  But if two concurrent
-/// builds happen to share the same `project_root` (e.g., via retry in
-/// `MAX_TARGETS_ATTEMPTS`), the second buck2 invocation would talk to the
-/// first daemon whose internal paths point at a **stale** mountpoint — leading
-/// to `ESTALE` / `ENOENT` cascades.
-///
-/// By deriving `--isolation-dir` from `SHA256(repo_path)`, we get:
-/// - **Same mount path → same daemon** (avoids daemon startup cost on retry)
-/// - **Different mount paths → different daemons** (avoids cross-contamination)
-///
-/// # Format
-///
-/// Buck2 `--isolation-dir` expects a plain directory **name** (no path
-/// separators).  Buck2 itself stores daemon state under
-/// `<project_root>/.buck2/<isolation_dir>/`, so we only need to return a
-/// unique name – not a full path.
+/// Orion now mounts repo views into stable per-worker slots. Hashing the
+/// mounted project root keeps `old` and `new` views isolated while allowing
+/// repeated builds on the same worker slot to reuse the same Buck2 runtime.
 fn buck2_isolation_dir(repo_path: &Path) -> anyhow::Result<String> {
     let digest = ring::digest::digest(
         &ring::digest::SHA256,
@@ -305,12 +317,11 @@ fn buck2_isolation_dir(repo_path: &Path) -> anyhow::Result<String> {
     Ok(format!("buck2-isolation-{suffix}"))
 }
 
-/// Best-effort cleanup for per-mount buck2 daemons.
+/// Best-effort Buck2 daemon reset for a worker slot.
 ///
-/// With unique mountpoints each build gets a fresh `--isolation-dir`, which means
-/// buck2 may keep many idle daemons alive. Over time that can exhaust host limits
-/// (e.g. inotify/file locks) and make subsequent daemon startups fail.
-fn cleanup_buck2_daemon(repo_path: &Path) {
+/// The success path keeps daemons warm so target discovery and build can reuse
+/// the same runtime. Failure recovery still needs an explicit `buck2 kill`.
+fn kill_buck2_daemon(repo_path: &Path) {
     let Ok(isolation_dir) = buck2_isolation_dir(repo_path) else {
         return;
     };
@@ -397,7 +408,7 @@ fn ensure_local_buck_out(repo_path: &Path) -> anyhow::Result<PathBuf> {
     Ok(local_buck_out)
 }
 
-fn cleanup_local_buck_out(repo_path: &Path) {
+fn reset_local_buck_out(repo_path: &Path) {
     let Ok(local_buck_out) = local_buck_out_dir(repo_path) else {
         return;
     };
@@ -425,6 +436,11 @@ fn cleanup_local_buck_out(repo_path: &Path) {
             "Failed to remove local buck-out directory"
         );
     }
+}
+
+fn reset_buck2_runtime(repo_path: &Path) {
+    kill_buck2_daemon(repo_path);
+    reset_local_buck_out(repo_path);
 }
 
 fn buck2_build_arguments(isolation_dir: &str, targets: &[TargetLabel]) -> Vec<String> {
@@ -627,12 +643,10 @@ fn get_repo_targets(file_name: &str, repo_path: &Path) -> anyhow::Result<Targets
             .map_err(|err| anyhow!("Failed to flush writer: {}", err))?;
         let status = child.wait()?;
         if status.success() {
-            let targets = Targets::from_file(&jsonl_path);
-            cleanup_buck2_daemon(repo_path);
-            return targets;
+            return Targets::from_file(&jsonl_path);
         }
 
-        cleanup_buck2_daemon(repo_path);
+        kill_buck2_daemon(repo_path);
         tracing::warn!(
             "buck2 targets failed with status {} for repo {:?}",
             status,
@@ -945,29 +959,38 @@ async fn prepare_build_attempt(
     let preparation = async {
         wait_for_repo_mount_ready(&old_project_root).await?;
         wait_for_repo_mount_ready(&new_project_root).await?;
-        ensure_local_buck_out(&old_project_root)?;
-        ensure_local_buck_out(&new_project_root)?;
 
-        get_build_targets(
-            old_project_root.to_str().unwrap_or(&old_repo_mount_point),
-            new_project_root.to_str().unwrap_or(&repo_mount_point),
+        let old_runtime = BuckRuntime::prepare(old_project_root.clone())?;
+        let new_runtime = BuckRuntime::prepare(new_project_root.clone())?;
+
+        let targets = get_build_targets(
+            old_runtime
+                .project_root()
+                .to_str()
+                .unwrap_or(&old_repo_mount_point),
+            new_runtime
+                .project_root()
+                .to_str()
+                .unwrap_or(&repo_mount_point),
             changes.to_vec(),
         )
-        .await
+        .await?;
+
+        Ok::<_, anyhow::Error>((old_runtime, new_runtime, targets))
     }
     .await;
 
     match preparation {
-        Ok(targets) => Ok(PreparedBuildAttempt {
-            mount_point: repo_mount_point,
+        Ok((old_runtime, new_runtime, targets)) => Ok(PreparedBuildAttempt {
+            new_runtime,
+            old_runtime,
             mount_guard: guard,
             old_mount_guard: guard_old_repo,
-            old_project_root,
             targets,
         }),
         Err(err) => {
-            cleanup_local_buck_out(&new_project_root);
-            cleanup_local_buck_out(&old_project_root);
+            reset_buck2_runtime(&new_project_root);
+            reset_buck2_runtime(&old_project_root);
             guard.unmount().await;
             guard_old_repo.unmount().await;
             Err(err)
@@ -1040,10 +1063,10 @@ pub async fn build(
     }
 
     let PreparedBuildAttempt {
-        mount_point,
+        new_runtime,
+        old_runtime,
         mount_guard,
         old_mount_guard: mount_guard_old_repo,
-        old_project_root,
         targets,
     } = match prepared_attempt {
         Some(prepared) => prepared,
@@ -1075,9 +1098,6 @@ pub async fn build(
             output: skip_output,
         });
 
-        let new_project_root = PathBuf::from(&mount_point);
-        cleanup_local_buck_out(&new_project_root);
-        cleanup_local_buck_out(&old_project_root);
         mount_guard.unmount().await;
         mount_guard_old_repo.unmount().await;
 
@@ -1090,11 +1110,10 @@ pub async fn build(
     }
 
     let build_result = async {
-        let project_root = PathBuf::from(&mount_point);
-        let isolation_dir = buck2_isolation_dir(&project_root)?;
+        let project_root = new_runtime.project_root().to_path_buf();
         let mut cmd = Command::new("buck2");
         let cmd = cmd
-            .args(buck2_build_arguments(&isolation_dir, &targets))
+            .args(buck2_build_arguments(new_runtime.isolation_dir(), &targets))
             .current_dir(&project_root)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -1164,7 +1183,6 @@ pub async fn build(
             Some(status) => status,
             None => child.wait().await?,
         };
-        cleanup_buck2_daemon(&project_root);
         target_build_track.cancellation.cancel();
         let _ = target_build_track.tail_handle.await;
         let _ = target_build_track.process_handle.await;
@@ -1182,9 +1200,11 @@ pub async fn build(
     }
     .await;
 
-    let new_project_root = PathBuf::from(&mount_point);
-    cleanup_local_buck_out(&new_project_root);
-    cleanup_local_buck_out(&old_project_root);
+    if build_result.is_err() {
+        new_runtime.reset();
+        old_runtime.reset();
+    }
+
     mount_guard.unmount().await;
     mount_guard_old_repo.unmount().await;
 
@@ -1213,7 +1233,7 @@ mod tests {
             local_buck_out
         );
 
-        cleanup_local_buck_out(&repo_path);
+        reset_local_buck_out(&repo_path);
         std::fs::remove_dir_all(&repo_path).unwrap();
     }
 
@@ -1330,10 +1350,9 @@ mod tests {
         let job_id = format!("codex-mount-ready-{}", Uuid::new_v4());
         let (mountpoint, mount_id) = mount_antares_fs(&job_id, "/", None).await.unwrap();
         let project_root = PathBuf::from(&mountpoint);
-        let isolation_dir = "codex-mount-ready-test";
-
         wait_for_repo_mount_ready(&project_root).await.unwrap();
-        ensure_local_buck_out(&project_root).unwrap();
+        let runtime = BuckRuntime::prepare(project_root.clone()).unwrap();
+        let isolation_dir = runtime.isolation_dir();
 
         let audit_cells = run_buck2_command(
             &project_root,
@@ -1413,8 +1432,7 @@ mod tests {
             None
         };
 
-        cleanup_buck2_daemon(&project_root);
-        cleanup_local_buck_out(&project_root);
+        runtime.reset();
         let _ = unmount_antares_fs(&mount_id).await;
 
         assert!(
